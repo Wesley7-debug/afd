@@ -1,7 +1,7 @@
 import mongoose from "mongoose";
 import * as cheerio from "cheerio";
 import { connectDB } from "@/lib/mongodb";
-import { Founder, Company, CrawlSource, CrawlJob } from "@/models";
+import { Founder, Company, CrawlSource, CrawlJob, CrawlProgress } from "@/models";
 import {
   isSameDomain,
   normalizeUrl,
@@ -36,6 +36,9 @@ const DEFAULT_CONFIG: CrawlerConfig = {
   delayBetweenRequests: 1500,
   maxResponseSize: 5 * 1024 * 1024,
 };
+
+const PER_SITE_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes per site
+const PROGRESS_SAVE_INTERVAL = 10; // save state every N pages
 
 interface CrawlQueueEntry {
   url: string;
@@ -115,6 +118,89 @@ function insertByPriority(queue: CrawlQueueEntry[], entry: CrawlQueueEntry): voi
     }
   }
   queue.splice(low, 0, entry);
+}
+
+async function saveProgress(
+  sourceId: mongoose.Types.ObjectId,
+  state: CrawlState
+): Promise<void> {
+  try {
+    await CrawlProgress.findOneAndUpdate(
+      { sourceId },
+      {
+        sourceId,
+        visitedUrls: [...state.visited],
+        queue: state.queue.map((e) => ({
+          url: e.url,
+          depth: e.depth,
+          priority: e.priority,
+          reason: e.reason,
+        })),
+        pagesCrawled: state.pagesCrawled,
+        pagesSkipped: state.pagesSkipped,
+        foundersFound: state.foundersFound,
+        newFounders: state.newFounders,
+        updatedFounders: state.updatedFounders,
+        duplicatesFound: state.duplicatesFound,
+        fundingPagesFound: state.fundingPagesFound,
+        hiringPagesFound: state.hiringPagesFound,
+        founderProfilesFound: state.founderProfilesFound,
+        companiesDiscovered: state.companiesDiscovered,
+        countriesDiscovered: [...state.countriesDiscovered],
+        errors: state.errors,
+        lastSavedAt: new Date(),
+      },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error(`[CrawlProgress] Failed to save progress for ${sourceId}:`, err);
+  }
+}
+
+async function clearProgress(sourceId: mongoose.Types.ObjectId): Promise<void> {
+  try {
+    await CrawlProgress.deleteOne({ sourceId });
+  } catch (err) {
+    console.error(`[CrawlProgress] Failed to clear progress for ${sourceId}:`, err);
+  }
+}
+
+async function loadProgress(
+  sourceId: mongoose.Types.ObjectId
+): Promise<CrawlState | null> {
+  try {
+    const saved = await CrawlProgress.findOne({ sourceId });
+    if (!saved) return null;
+
+    console.log(
+      `[CrawlProgress] Resuming source ${sourceId}: ${saved.pagesCrawled} pages crawled, ${saved.queue.length} URLs queued`
+    );
+
+    return {
+      visited: new Set(saved.visitedUrls),
+      queue: saved.queue.map((e) => ({
+        url: e.url,
+        depth: e.depth,
+        priority: e.priority,
+        reason: e.reason,
+      })),
+      pagesCrawled: saved.pagesCrawled,
+      pagesSkipped: saved.pagesSkipped,
+      foundersFound: saved.foundersFound,
+      newFounders: saved.newFounders,
+      updatedFounders: saved.updatedFounders,
+      duplicatesFound: saved.duplicatesFound,
+      fundingPagesFound: saved.fundingPagesFound,
+      hiringPagesFound: saved.hiringPagesFound,
+      founderProfilesFound: saved.founderProfilesFound,
+      companiesDiscovered: saved.companiesDiscovered,
+      countriesDiscovered: new Set(saved.countriesDiscovered),
+      errors: saved.errors,
+    };
+  } catch (err) {
+    console.error(`[CrawlProgress] Failed to load progress for ${sourceId}:`, err);
+    return null;
+  }
 }
 
 async function fetchPage(
@@ -492,6 +578,9 @@ export async function runCrawler(sourceId?: string): Promise<void> {
       continue;
     }
 
+    const savedProgress = await loadProgress(source._id as mongoose.Types.ObjectId);
+    const isResuming = savedProgress !== null;
+
     const job = new CrawlJob({
       sourceId: source._id,
       status: "running",
@@ -515,7 +604,7 @@ export async function runCrawler(sourceId?: string): Promise<void> {
         robots.crawlDelay * 1000
       );
 
-      const initialState: CrawlState = {
+      const state: CrawlState = savedProgress || {
         visited: new Set(),
         queue: [],
         pagesCrawled: 0,
@@ -532,42 +621,59 @@ export async function runCrawler(sourceId?: string): Promise<void> {
         errors: [],
       };
 
-      const { score: homeScore, reason: homeReason } = scoreUrl(source.baseUrl);
-      initialState.queue.push({
-        url: source.baseUrl,
-        depth: 0,
-        priority: homeScore + 10,
-        reason: `homepage (${homeReason})`,
-      });
+      if (state.queue.length === 0) {
+        const { score: homeScore, reason: homeReason } = scoreUrl(source.baseUrl);
+        state.queue.push({
+          url: source.baseUrl,
+          depth: 0,
+          priority: homeScore + 10,
+          reason: `homepage (${homeReason})`,
+        });
+      }
 
-      while (initialState.queue.length > 0 && initialState.pagesCrawled < config.maxPages) {
-        const entry = initialState.queue.shift()!;
+      const siteStartTime = Date.now();
+
+      while (state.queue.length > 0 && state.pagesCrawled < config.maxPages) {
+        if (Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS) {
+          console.log(
+            `[Crawl] Per-site timeout (3 min) reached for ${source.name} after ${state.pagesCrawled} pages. Saving state...`
+          );
+          await saveProgress(source._id as mongoose.Types.ObjectId, state);
+          break;
+        }
+
+        const entry = state.queue.shift()!;
 
         if (entry.depth > config.maxDepth) {
-          initialState.pagesSkipped++;
+          state.pagesSkipped++;
           continue;
         }
 
         const normalizedUrl = normalizeUrl(entry.url, source.baseUrl);
-        if (initialState.visited.has(normalizedUrl)) {
-          initialState.pagesSkipped++;
+        if (state.visited.has(normalizedUrl)) {
+          state.pagesSkipped++;
           continue;
         }
 
-        initialState.visited.add(normalizedUrl);
+        state.visited.add(normalizedUrl);
 
         if (!isAllowedByRobots(normalizedUrl, robots.disallowed)) {
-          initialState.pagesSkipped++;
+          state.pagesSkipped++;
           continue;
         }
 
         const page = await fetchPage(normalizedUrl, config);
         if (!page) {
-          initialState.pagesSkipped++;
+          state.pagesSkipped++;
           continue;
         }
 
-        initialState.pagesCrawled++;
+        state.pagesCrawled++;
+
+        if (state.pagesCrawled % PROGRESS_SAVE_INTERVAL === 0) {
+          await saveProgress(source._id as mongoose.Types.ObjectId, state);
+        }
+
         await new Promise((resolve) =>
           setTimeout(resolve, config.delayBetweenRequests)
         );
@@ -577,29 +683,29 @@ export async function runCrawler(sourceId?: string): Promise<void> {
           const bodyText = $("body").text() || "";
 
           if (/funding|raises|raised|investment|backed by/i.test(bodyText)) {
-            initialState.fundingPagesFound++;
+            state.fundingPagesFound++;
           }
           if (/hiring|we.re hiring|join our team|careers|open positions/i.test(bodyText)) {
-            initialState.hiringPagesFound++;
+            state.hiringPagesFound++;
           }
 
           const detectedFounders = detectFoundersOnPage($, page.html, normalizedUrl);
           const founderNames: string[] = [];
 
           for (const detected of detectedFounders) {
-            initialState.foundersFound++;
+            state.foundersFound++;
             founderNames.push(detected.name);
 
             if (detected.country) {
-              initialState.countriesDiscovered.add(detected.country);
+              state.countriesDiscovered.add(detected.country);
             }
 
             const result = await saveFounderToDb(detected);
 
             if (result.isNew) {
-              initialState.newFounders++;
+              state.newFounders++;
             } else if (result.isDuplicate) {
-              initialState.duplicatesFound++;
+              state.duplicatesFound++;
             }
 
             if (detected.company) {
@@ -614,18 +720,17 @@ export async function runCrawler(sourceId?: string): Promise<void> {
                   detected
                 );
                 if (companyResult.isNew) {
-                  initialState.companiesDiscovered++;
+                  state.companiesDiscovered++;
                 }
 
                 if (companyResult.companyId && !result.isDuplicate) {
-                  const companyUrl = `https://${normalizedUrl.split("/")[2]}`;
                   const companyBase = new URL(normalizedUrl).origin;
 
                   for (const suffix of ["/about", "/team", "/founders", "/leadership", "/careers"]) {
                     const candidateUrl = companyBase + suffix;
-                    if (!initialState.visited.has(candidateUrl)) {
+                    if (!state.visited.has(candidateUrl)) {
                       const { score } = scoreUrl(candidateUrl);
-                      insertByPriority(initialState.queue, {
+                      insertByPriority(state.queue, {
                         url: candidateUrl,
                         depth: entry.depth + 1,
                         priority: score + 20,
@@ -639,12 +744,12 @@ export async function runCrawler(sourceId?: string): Promise<void> {
           }
 
           if (founderNames.length > 0) {
-            initialState.founderProfilesFound++;
+            state.founderProfilesFound++;
             const profileLinks = extractFounderProfileLinks($, normalizedUrl, source.baseUrl, founderNames);
             for (const link of profileLinks) {
-              if (!initialState.visited.has(link)) {
+              if (!state.visited.has(link)) {
                 const { score } = scoreUrl(link);
-                insertByPriority(initialState.queue, {
+                insertByPriority(state.queue, {
                   url: link,
                   depth: entry.depth + 1,
                   priority: score + 25,
@@ -656,9 +761,9 @@ export async function runCrawler(sourceId?: string): Promise<void> {
 
           const links = extractLinks($, normalizedUrl, source.baseUrl);
           for (const link of links) {
-            if (!initialState.visited.has(link)) {
+            if (!state.visited.has(link)) {
               const { score, reason } = scoreUrl(link, bodyText);
-              insertByPriority(initialState.queue, {
+              insertByPriority(state.queue, {
                 url: link,
                 depth: entry.depth + 1,
                 priority: score,
@@ -667,34 +772,48 @@ export async function runCrawler(sourceId?: string): Promise<void> {
             }
           }
         } catch (error) {
-          initialState.errors.push(
+          state.errors.push(
             `Error parsing ${normalizedUrl}: ${error instanceof Error ? error.message : "Unknown"}`
           );
         }
       }
 
+      const queueExhausted = state.queue.length === 0;
+      const timedOut = Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS;
+
+      if (queueExhausted || state.pagesCrawled >= config.maxPages) {
+        await clearProgress(source._id as mongoose.Types.ObjectId);
+      }
+
       job.status = "completed";
       job.completedAt = new Date();
-      job.pagesCrawled = initialState.pagesCrawled;
-      job.pagesSkipped = initialState.pagesSkipped;
-      job.foundersFound = initialState.foundersFound;
-      job.newFounders = initialState.newFounders;
-      job.updatedFounders = initialState.updatedFounders;
-      job.duplicatesFound = initialState.duplicatesFound;
-      job.fundingPagesFound = initialState.fundingPagesFound;
-      job.hiringPagesFound = initialState.hiringPagesFound;
-      job.founderProfilesFound = initialState.founderProfilesFound;
-      job.companiesDiscovered = initialState.companiesDiscovered;
-      job.countriesDiscovered = [...initialState.countriesDiscovered];
-      job.crawlErrors = initialState.errors;
+      job.pagesCrawled = state.pagesCrawled;
+      job.pagesSkipped = state.pagesSkipped;
+      job.foundersFound = state.foundersFound;
+      job.newFounders = state.newFounders;
+      job.updatedFounders = state.updatedFounders;
+      job.duplicatesFound = state.duplicatesFound;
+      job.fundingPagesFound = state.fundingPagesFound;
+      job.hiringPagesFound = state.hiringPagesFound;
+      job.founderProfilesFound = state.founderProfilesFound;
+      job.companiesDiscovered = state.companiesDiscovered;
+      job.countriesDiscovered = [...state.countriesDiscovered];
+      job.crawlErrors = state.errors;
+      if (timedOut) {
+        job.crawlErrors.push(
+          `Per-site timeout (3 min) reached. Progress saved. ${state.queue.length} URLs remaining.`
+        );
+      }
       await job.save();
 
       source.lastCrawledAt = new Date();
-      source.nextCrawlAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      if (!timedOut) {
+        source.nextCrawlAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      }
       source.crawlStatus = "idle";
-      source.pagesCrawled += initialState.pagesCrawled;
-      source.foundersDiscovered += initialState.newFounders;
-      source.crawlErrors = initialState.errors;
+      source.pagesCrawled += state.pagesCrawled;
+      source.foundersDiscovered += state.newFounders;
+      source.crawlErrors = state.errors;
       await source.save();
     } catch (error) {
       job.status = "failed";
@@ -732,6 +851,8 @@ async function crawlOneSource(
   source: InstanceType<typeof CrawlSource>,
   baseConfig: CrawlerConfig
 ): Promise<SourceCrawlResult> {
+  const savedProgress = await loadProgress(source._id as mongoose.Types.ObjectId);
+
   const job = new CrawlJob({
     sourceId: source._id,
     status: "running",
@@ -751,7 +872,7 @@ async function crawlOneSource(
       robots.crawlDelay * 1000
     );
 
-    const initialState: CrawlState = {
+    const state: CrawlState = savedProgress || {
       visited: new Set(),
       queue: [],
       pagesCrawled: 0,
@@ -768,41 +889,58 @@ async function crawlOneSource(
       errors: [],
     };
 
-    const { score: homeScore, reason: homeReason } = scoreUrl(source.baseUrl);
-    initialState.queue.push({
-      url: source.baseUrl,
-      depth: 0,
-      priority: homeScore + 10,
-      reason: `homepage (${homeReason})`,
-    });
+    if (state.queue.length === 0) {
+      const { score: homeScore, reason: homeReason } = scoreUrl(source.baseUrl);
+      state.queue.push({
+        url: source.baseUrl,
+        depth: 0,
+        priority: homeScore + 10,
+        reason: `homepage (${homeReason})`,
+      });
+    }
 
-    while (initialState.queue.length > 0 && initialState.pagesCrawled < config.maxPages) {
-      const entry = initialState.queue.shift()!;
+    const siteStartTime = Date.now();
+
+    while (state.queue.length > 0 && state.pagesCrawled < config.maxPages) {
+      if (Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS) {
+        console.log(
+          `[Crawl] Per-site timeout (3 min) reached for ${source.name} after ${state.pagesCrawled} pages. Saving state...`
+        );
+        await saveProgress(source._id as mongoose.Types.ObjectId, state);
+        break;
+      }
+
+      const entry = state.queue.shift()!;
       if (entry.depth > config.maxDepth) {
-        initialState.pagesSkipped++;
+        state.pagesSkipped++;
         continue;
       }
 
       const normalizedUrl = normalizeUrl(entry.url, source.baseUrl);
-      if (initialState.visited.has(normalizedUrl)) {
-        initialState.pagesSkipped++;
+      if (state.visited.has(normalizedUrl)) {
+        state.pagesSkipped++;
         continue;
       }
 
-      initialState.visited.add(normalizedUrl);
+      state.visited.add(normalizedUrl);
 
       if (!isAllowedByRobots(normalizedUrl, robots.disallowed)) {
-        initialState.pagesSkipped++;
+        state.pagesSkipped++;
         continue;
       }
 
       const page = await fetchPage(normalizedUrl, config);
       if (!page) {
-        initialState.pagesSkipped++;
+        state.pagesSkipped++;
         continue;
       }
 
-      initialState.pagesCrawled++;
+      state.pagesCrawled++;
+
+      if (state.pagesCrawled % PROGRESS_SAVE_INTERVAL === 0) {
+        await saveProgress(source._id as mongoose.Types.ObjectId, state);
+      }
+
       await new Promise((resolve) =>
         setTimeout(resolve, config.delayBetweenRequests)
       );
@@ -812,29 +950,29 @@ async function crawlOneSource(
         const bodyText = $("body").text() || "";
 
         if (/funding|raises|raised|investment|backed by/i.test(bodyText)) {
-          initialState.fundingPagesFound++;
+          state.fundingPagesFound++;
         }
         if (/hiring|we.re hiring|join our team|careers|open positions/i.test(bodyText)) {
-          initialState.hiringPagesFound++;
+          state.hiringPagesFound++;
         }
 
         const detectedFounders = detectFoundersOnPage($, page.html, normalizedUrl);
         const founderNames: string[] = [];
 
         for (const detected of detectedFounders) {
-          initialState.foundersFound++;
+          state.foundersFound++;
           founderNames.push(detected.name);
 
           if (detected.country) {
-            initialState.countriesDiscovered.add(detected.country);
+            state.countriesDiscovered.add(detected.country);
           }
 
           const result = await saveFounderToDb(detected);
 
           if (result.isNew) {
-            initialState.newFounders++;
+            state.newFounders++;
           } else if (result.isDuplicate) {
-            initialState.duplicatesFound++;
+            state.duplicatesFound++;
           }
 
           if (detected.company) {
@@ -849,16 +987,16 @@ async function crawlOneSource(
                 detected
               );
               if (companyResult.isNew) {
-                initialState.companiesDiscovered++;
+                state.companiesDiscovered++;
               }
 
               if (companyResult.companyId && !result.isDuplicate) {
                 const companyBase = new URL(normalizedUrl).origin;
                 for (const suffix of ["/about", "/team", "/founders", "/leadership", "/careers"]) {
                   const candidateUrl = companyBase + suffix;
-                  if (!initialState.visited.has(candidateUrl)) {
+                  if (!state.visited.has(candidateUrl)) {
                     const { score } = scoreUrl(candidateUrl);
-                    insertByPriority(initialState.queue, {
+                    insertByPriority(state.queue, {
                       url: candidateUrl,
                       depth: entry.depth + 1,
                       priority: score + 20,
@@ -872,12 +1010,12 @@ async function crawlOneSource(
         }
 
         if (founderNames.length > 0) {
-          initialState.founderProfilesFound++;
+          state.founderProfilesFound++;
           const profileLinks = extractFounderProfileLinks($, normalizedUrl, source.baseUrl, founderNames);
           for (const link of profileLinks) {
-            if (!initialState.visited.has(link)) {
+            if (!state.visited.has(link)) {
               const { score } = scoreUrl(link);
-              insertByPriority(initialState.queue, {
+              insertByPriority(state.queue, {
                 url: link,
                 depth: entry.depth + 1,
                 priority: score + 25,
@@ -889,9 +1027,9 @@ async function crawlOneSource(
 
         const links = extractLinks($, normalizedUrl, source.baseUrl);
         for (const link of links) {
-          if (!initialState.visited.has(link)) {
+          if (!state.visited.has(link)) {
             const { score, reason } = scoreUrl(link, bodyText);
-            insertByPriority(initialState.queue, {
+            insertByPriority(state.queue, {
               url: link,
               depth: entry.depth + 1,
               priority: score,
@@ -900,42 +1038,56 @@ async function crawlOneSource(
           }
         }
       } catch (error) {
-        initialState.errors.push(
+        state.errors.push(
           `Error parsing ${normalizedUrl}: ${error instanceof Error ? error.message : "Unknown"}`
         );
       }
     }
 
+    const queueExhausted = state.queue.length === 0;
+    const timedOut = Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS;
+
+    if (queueExhausted || state.pagesCrawled >= config.maxPages) {
+      await clearProgress(source._id as mongoose.Types.ObjectId);
+    }
+
     job.status = "completed";
     job.completedAt = new Date();
-    job.pagesCrawled = initialState.pagesCrawled;
-    job.pagesSkipped = initialState.pagesSkipped;
-    job.foundersFound = initialState.foundersFound;
-    job.newFounders = initialState.newFounders;
-    job.updatedFounders = initialState.updatedFounders;
-    job.duplicatesFound = initialState.duplicatesFound;
-    job.fundingPagesFound = initialState.fundingPagesFound;
-    job.hiringPagesFound = initialState.hiringPagesFound;
-    job.founderProfilesFound = initialState.founderProfilesFound;
-    job.companiesDiscovered = initialState.companiesDiscovered;
-    job.countriesDiscovered = [...initialState.countriesDiscovered];
-    job.crawlErrors = initialState.errors;
+    job.pagesCrawled = state.pagesCrawled;
+    job.pagesSkipped = state.pagesSkipped;
+    job.foundersFound = state.foundersFound;
+    job.newFounders = state.newFounders;
+    job.updatedFounders = state.updatedFounders;
+    job.duplicatesFound = state.duplicatesFound;
+    job.fundingPagesFound = state.fundingPagesFound;
+    job.hiringPagesFound = state.hiringPagesFound;
+    job.founderProfilesFound = state.founderProfilesFound;
+    job.companiesDiscovered = state.companiesDiscovered;
+    job.countriesDiscovered = [...state.countriesDiscovered];
+    job.crawlErrors = state.errors;
+    if (timedOut) {
+      job.crawlErrors.push(
+        `Per-site timeout (3 min) reached. Progress saved. ${state.queue.length} URLs remaining.`
+      );
+    }
     await job.save();
 
     source.lastCrawledAt = new Date();
-    source.nextCrawlAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    if (!timedOut) {
+      source.nextCrawlAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    }
     source.crawlStatus = "idle";
-    source.pagesCrawled += initialState.pagesCrawled;
-    source.foundersDiscovered += initialState.newFounders;
-    source.crawlErrors = initialState.errors;
+    source.pagesCrawled += state.pagesCrawled;
+    source.foundersDiscovered += state.newFounders;
+    source.crawlErrors = state.errors;
     await source.save();
 
     return {
       sourceName: source.name,
-      pagesCrawled: initialState.pagesCrawled,
-      newFounders: initialState.newFounders,
-      companiesDiscovered: initialState.companiesDiscovered,
-      errors: initialState.errors,
+      pagesCrawled: state.pagesCrawled,
+      newFounders: state.newFounders,
+      companiesDiscovered: state.companiesDiscovered,
+      errors: state.errors,
     };
   } catch (error) {
     job.status = "failed";
@@ -998,21 +1150,25 @@ export async function runFullCrawl(opts?: {
 
   const sources = await CrawlSource.find({ enabled: true });
 
-  const skipSources = await CrawlSource.find({
-    _id: { $in: sources.map((s) => s._id) },
-  }).then(async () => {
-    const running: string[] = [];
-    for (const s of sources) {
-      const runningJob = await CrawlJob.findOne({ sourceId: s._id, status: "running" });
-      if (runningJob) running.push(s.name);
+  const skipSources: string[] = [];
+  const resumeSources: string[] = [];
+
+  for (const s of sources) {
+    const runningJob = await CrawlJob.findOne({ sourceId: s._id, status: "running" });
+    if (runningJob) {
+      skipSources.push(s.name);
+      continue;
     }
-    return running;
-  });
+    const hasProgress = await CrawlProgress.findOne({ sourceId: s._id });
+    if (hasProgress) {
+      resumeSources.push(s.name);
+    }
+  }
 
   const availableSources = sources.filter((s) => !skipSources.includes(s.name));
 
   console.log(
-    `[Crawl] ${availableSources.length} sources to crawl, ${skipSources.length} skipped (already running), concurrency: ${concurrency}`
+    `[Crawl] ${availableSources.length} sources to crawl, ${resumeSources.length} will resume, ${skipSources.length} skipped (already running), concurrency: ${concurrency}`
   );
 
   const tasks = availableSources.map((source) => () => crawlOneSource(source, config));
