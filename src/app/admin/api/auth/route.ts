@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const ADMIN_EMAIL = "eugenefidelis573@gmail.com";
-const ADMIN_SECRET = "af-admin-2024-xK9mP2vQ8nR5";
+const ADMIN_SECRET = "Investor@1";
 
 export async function POST(req: NextRequest) {
   try {
@@ -19,9 +19,15 @@ export async function POST(req: NextRequest) {
       return response;
     }
 
-    return NextResponse.json({ ok: false, error: "Invalid credentials" }, { status: 401 });
+    return NextResponse.json(
+      { ok: false, error: "Invalid credentials" },
+      { status: 401 },
+    );
   } catch {
-    return NextResponse.json({ ok: false, error: "Request failed" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "Request failed" },
+      { status: 500 },
+    );
   }
 }
 
@@ -30,5 +36,8 @@ export async function GET(req: NextRequest) {
   if (token === ADMIN_SECRET) {
     return NextResponse.json({ ok: true, authenticated: true });
   }
-  return NextResponse.json({ ok: false, authenticated: false }, { status: 401 });
+  return NextResponse.json(
+    { ok: false, authenticated: false },
+    { status: 401 },
+  );
 }
