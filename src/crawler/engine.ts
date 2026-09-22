@@ -711,3 +711,333 @@ export async function runCrawler(sourceId?: string): Promise<void> {
     }
   }
 }
+
+interface CrawlResult {
+  pagesCrawled: number;
+  foundersDiscovered: number;
+  companiesDiscovered: number;
+  duration: number;
+  errors: string[];
+}
+
+interface SourceCrawlResult {
+  sourceName: string;
+  pagesCrawled: number;
+  newFounders: number;
+  companiesDiscovered: number;
+  errors: string[];
+}
+
+async function crawlOneSource(
+  source: InstanceType<typeof CrawlSource>,
+  baseConfig: CrawlerConfig
+): Promise<SourceCrawlResult> {
+  const job = new CrawlJob({
+    sourceId: source._id,
+    status: "running",
+    startedAt: new Date(),
+  });
+  await job.save();
+
+  source.crawlStatus = "crawling";
+  await source.save();
+
+  const config = { ...baseConfig };
+
+  try {
+    const robots = await checkRobotsTxt(source.baseUrl, config);
+    config.delayBetweenRequests = Math.max(
+      config.delayBetweenRequests,
+      robots.crawlDelay * 1000
+    );
+
+    const initialState: CrawlState = {
+      visited: new Set(),
+      queue: [],
+      pagesCrawled: 0,
+      pagesSkipped: 0,
+      foundersFound: 0,
+      newFounders: 0,
+      updatedFounders: 0,
+      duplicatesFound: 0,
+      fundingPagesFound: 0,
+      hiringPagesFound: 0,
+      founderProfilesFound: 0,
+      companiesDiscovered: 0,
+      countriesDiscovered: new Set(),
+      errors: [],
+    };
+
+    const { score: homeScore, reason: homeReason } = scoreUrl(source.baseUrl);
+    initialState.queue.push({
+      url: source.baseUrl,
+      depth: 0,
+      priority: homeScore + 10,
+      reason: `homepage (${homeReason})`,
+    });
+
+    while (initialState.queue.length > 0 && initialState.pagesCrawled < config.maxPages) {
+      const entry = initialState.queue.shift()!;
+      if (entry.depth > config.maxDepth) {
+        initialState.pagesSkipped++;
+        continue;
+      }
+
+      const normalizedUrl = normalizeUrl(entry.url, source.baseUrl);
+      if (initialState.visited.has(normalizedUrl)) {
+        initialState.pagesSkipped++;
+        continue;
+      }
+
+      initialState.visited.add(normalizedUrl);
+
+      if (!isAllowedByRobots(normalizedUrl, robots.disallowed)) {
+        initialState.pagesSkipped++;
+        continue;
+      }
+
+      const page = await fetchPage(normalizedUrl, config);
+      if (!page) {
+        initialState.pagesSkipped++;
+        continue;
+      }
+
+      initialState.pagesCrawled++;
+      await new Promise((resolve) =>
+        setTimeout(resolve, config.delayBetweenRequests)
+      );
+
+      try {
+        const $ = cheerio.load(page.html);
+        const bodyText = $("body").text() || "";
+
+        if (/funding|raises|raised|investment|backed by/i.test(bodyText)) {
+          initialState.fundingPagesFound++;
+        }
+        if (/hiring|we.re hiring|join our team|careers|open positions/i.test(bodyText)) {
+          initialState.hiringPagesFound++;
+        }
+
+        const detectedFounders = detectFoundersOnPage($, page.html, normalizedUrl);
+        const founderNames: string[] = [];
+
+        for (const detected of detectedFounders) {
+          initialState.foundersFound++;
+          founderNames.push(detected.name);
+
+          if (detected.country) {
+            initialState.countriesDiscovered.add(detected.country);
+          }
+
+          const result = await saveFounderToDb(detected);
+
+          if (result.isNew) {
+            initialState.newFounders++;
+          } else if (result.isDuplicate) {
+            initialState.duplicatesFound++;
+          }
+
+          if (detected.company) {
+            const founderId = result.founderId || (await Founder.findOne({
+              normalizedName: normalizeFounderName(detected.name),
+            }))?._id as mongoose.Types.ObjectId | undefined;
+
+            if (founderId) {
+              const companyResult = await saveCompanyToDb(
+                detected.company,
+                founderId,
+                detected
+              );
+              if (companyResult.isNew) {
+                initialState.companiesDiscovered++;
+              }
+
+              if (companyResult.companyId && !result.isDuplicate) {
+                const companyBase = new URL(normalizedUrl).origin;
+                for (const suffix of ["/about", "/team", "/founders", "/leadership", "/careers"]) {
+                  const candidateUrl = companyBase + suffix;
+                  if (!initialState.visited.has(candidateUrl)) {
+                    const { score } = scoreUrl(candidateUrl);
+                    insertByPriority(initialState.queue, {
+                      url: candidateUrl,
+                      depth: entry.depth + 1,
+                      priority: score + 20,
+                      reason: `company page: ${suffix}`,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (founderNames.length > 0) {
+          initialState.founderProfilesFound++;
+          const profileLinks = extractFounderProfileLinks($, normalizedUrl, source.baseUrl, founderNames);
+          for (const link of profileLinks) {
+            if (!initialState.visited.has(link)) {
+              const { score } = scoreUrl(link);
+              insertByPriority(initialState.queue, {
+                url: link,
+                depth: entry.depth + 1,
+                priority: score + 25,
+                reason: "founder profile link",
+              });
+            }
+          }
+        }
+
+        const links = extractLinks($, normalizedUrl, source.baseUrl);
+        for (const link of links) {
+          if (!initialState.visited.has(link)) {
+            const { score, reason } = scoreUrl(link, bodyText);
+            insertByPriority(initialState.queue, {
+              url: link,
+              depth: entry.depth + 1,
+              priority: score,
+              reason,
+            });
+          }
+        }
+      } catch (error) {
+        initialState.errors.push(
+          `Error parsing ${normalizedUrl}: ${error instanceof Error ? error.message : "Unknown"}`
+        );
+      }
+    }
+
+    job.status = "completed";
+    job.completedAt = new Date();
+    job.pagesCrawled = initialState.pagesCrawled;
+    job.pagesSkipped = initialState.pagesSkipped;
+    job.foundersFound = initialState.foundersFound;
+    job.newFounders = initialState.newFounders;
+    job.updatedFounders = initialState.updatedFounders;
+    job.duplicatesFound = initialState.duplicatesFound;
+    job.fundingPagesFound = initialState.fundingPagesFound;
+    job.hiringPagesFound = initialState.hiringPagesFound;
+    job.founderProfilesFound = initialState.founderProfilesFound;
+    job.companiesDiscovered = initialState.companiesDiscovered;
+    job.countriesDiscovered = [...initialState.countriesDiscovered];
+    job.crawlErrors = initialState.errors;
+    await job.save();
+
+    source.lastCrawledAt = new Date();
+    source.nextCrawlAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    source.crawlStatus = "idle";
+    source.pagesCrawled += initialState.pagesCrawled;
+    source.foundersDiscovered += initialState.newFounders;
+    source.crawlErrors = initialState.errors;
+    await source.save();
+
+    return {
+      sourceName: source.name,
+      pagesCrawled: initialState.pagesCrawled,
+      newFounders: initialState.newFounders,
+      companiesDiscovered: initialState.companiesDiscovered,
+      errors: initialState.errors,
+    };
+  } catch (error) {
+    job.status = "failed";
+    job.completedAt = new Date();
+    job.errorMessage = error instanceof Error ? error.message : "Unknown error";
+    await job.save();
+
+    source.crawlStatus = "error";
+    source.crawlErrors.push(error instanceof Error ? error.message : "Unknown error");
+    await source.save();
+
+    const errMsg = error instanceof Error ? error.message : "Unknown error";
+    return {
+      sourceName: source.name,
+      pagesCrawled: 0,
+      newFounders: 0,
+      companiesDiscovered: 0,
+      errors: [errMsg],
+    };
+  }
+}
+
+async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  concurrency: number
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < tasks.length) {
+      const i = index++;
+      results[i] = await tasks[i]();
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+export async function runFullCrawl(opts?: {
+  maxPages?: number;
+  maxDepth?: number;
+  maxConcurrent?: number;
+  delayMs?: number;
+  timeoutMs?: number;
+}): Promise<CrawlResult> {
+  const startTime = Date.now();
+  const concurrency = opts?.maxConcurrent ?? 3;
+  const config: CrawlerConfig = {
+    ...DEFAULT_CONFIG,
+    maxPages: opts?.maxPages ?? DEFAULT_CONFIG.maxPages,
+    maxDepth: opts?.maxDepth ?? DEFAULT_CONFIG.maxDepth,
+    delayBetweenRequests: opts?.delayMs ?? DEFAULT_CONFIG.delayBetweenRequests,
+    requestTimeout: opts?.timeoutMs ?? DEFAULT_CONFIG.requestTimeout,
+  };
+
+  await connectDB();
+
+  const sources = await CrawlSource.find({ enabled: true });
+
+  const skipSources = await CrawlSource.find({
+    _id: { $in: sources.map((s) => s._id) },
+  }).then(async () => {
+    const running: string[] = [];
+    for (const s of sources) {
+      const runningJob = await CrawlJob.findOne({ sourceId: s._id, status: "running" });
+      if (runningJob) running.push(s.name);
+    }
+    return running;
+  });
+
+  const availableSources = sources.filter((s) => !skipSources.includes(s.name));
+
+  console.log(
+    `[Crawl] ${availableSources.length} sources to crawl, ${skipSources.length} skipped (already running), concurrency: ${concurrency}`
+  );
+
+  const tasks = availableSources.map((source) => () => crawlOneSource(source, config));
+  const results = await runWithConcurrency(tasks, concurrency);
+
+  const allErrors: string[] = [];
+  let totalPages = 0;
+  let totalFounders = 0;
+  let totalCompanies = 0;
+
+  for (const r of results) {
+    totalPages += r.pagesCrawled;
+    totalFounders += r.newFounders;
+    totalCompanies += r.companiesDiscovered;
+    allErrors.push(...r.errors);
+    console.log(
+      `  [${r.sourceName}] ${r.pagesCrawled} pages, ${r.newFounders} founders, ${r.companiesDiscovered} companies, ${r.errors.length} errors`
+    );
+  }
+
+  return {
+    pagesCrawled: totalPages,
+    foundersDiscovered: totalFounders,
+    companiesDiscovered: totalCompanies,
+    duration: Date.now() - startTime,
+    errors: allErrors,
+  };
+}
