@@ -368,6 +368,7 @@ export const FUNDING_TERMS = [
   "investment", "investment round", "funding round", "venture capital",
   "vc", "investors", "backed by", "secured funding", "closed funding",
   "announced funding", "fundraise", "capital raise", "capital",
+  "million", "million funding", "investment",
 ];
 
 export const HIRING_TERMS = [
@@ -409,13 +410,14 @@ export const URL_PRIORITY_KEYWORDS: Record<string, number> = {
   "funding": 25,
   "fundraising": 25,
   "raised": 20,
-  "raises": 20,
+  "raises": 25,
   "investment": 20,
   "investor": 15,
   "seed": 15,
   "pre-seed": 15,
   "series-a": 15,
   "series-b": 15,
+  "series-c": 15,
   "venture": 15,
   "capital": 15,
   "accelerator": 15,
@@ -423,19 +425,22 @@ export const URL_PRIORITY_KEYWORDS: Record<string, number> = {
   "founder-story": 30,
   "founder-profile": 30,
   "entrepreneur-profile": 25,
+  "interview": 20,
   "launch": 10,
   "launched": 10,
-  "hiring": 20,
-  "jobs": 10,
-  "careers": 10,
+  "hiring": 25,
+  "jobs": 15,
+  "careers": 15,
   "management": 10,
+  "profile": 15,
 };
 
 export const URL_DEPRIORITIZE_PATTERNS = [
   "contact", "privacy", "terms", "cookies", "pricing", "login",
   "signup", "register", "auth", "forgot", "reset", "support",
   "help", "faq", "legal", "disclaimer", "refund", "shipping",
-  "sitemap", "feed", "rss", "atom",
+  "sitemap", "feed", "rss", "atom", "newsletter", "archive",
+  "tag/", "tags/", "category/", "categories/", "?s=",
 ];
 
 export const PAGE_CONTENT_KEYWORDS: Record<string, number> = {
@@ -448,8 +453,22 @@ export const PAGE_CONTENT_KEYWORDS: Record<string, number> = {
   "cto": 10,
   "entrepreneur": 15,
   "raised": 15,
+  "raises": 20,
   "funding": 15,
+  "investment": 12,
+  "pre-seed": 15,
+  "seed round": 15,
+  "series a": 15,
+  "series b": 15,
+  "series c": 15,
+  "venture capital": 12,
+  "backed by": 12,
+  "funding round": 15,
+  "million": 8,
   "hiring": 10,
+  "we're hiring": 15,
+  "join our team": 12,
+  "careers": 8,
   "startup": 10,
   "team": 10,
 };

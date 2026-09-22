@@ -1,23 +1,28 @@
 import { connectDB } from "../lib/mongodb";
-import { runFullCrawl } from "../crawler/engine";
-import CrawlProgress from "../models/CrawlProgress";
+import { runUntilQueueEmpty, ensureCrawlerRunning, getQueueStats } from "../crawler/scheduler";
 
 async function main() {
   await connectDB();
 
-  const resumableCount = await CrawlProgress.countDocuments();
+  const mode = process.argv[2];
 
-  const result = await runFullCrawl({
-    maxPages: 500,
-    maxDepth: 8,
-    maxConcurrent: 3,
-    delayMs: 1500,
-    timeoutMs: 20000,
-  });
+  if (mode === "--daemon") {
+    await ensureCrawlerRunning();
+    // Keep the process alive; workers + scheduler run continuously.
+    console.log("[crawl] daemon mode — workers running, Ctrl+C to stop");
+    return;
+  }
 
+  console.log("[crawl] draining persistent queue...");
+  await runUntilQueueEmpty();
+  const stats = await getQueueStats();
+  console.log(
+    `[crawl] done. queued=${stats.queued} crawling=${stats.crawling} completed=${stats.completed} failed=${stats.failed}`
+  );
   process.exit(0);
 }
 
-main().catch(() => {
+main().catch((err) => {
+  console.error(err);
   process.exit(1);
 });

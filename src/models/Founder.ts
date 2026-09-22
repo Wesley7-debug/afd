@@ -16,6 +16,7 @@ export interface IFounder extends Document {
   xHandle: string;
   linkedinUrl: string;
   personalWebsiteUrl: string;
+  email: string;
   companyXUrl: string;
   companyLinkedinUrl: string;
   companyWebsiteUrl: string;
@@ -23,9 +24,10 @@ export interface IFounder extends Document {
   companySlug: string;
   companyLogoUrl: string;
   teamSize: number;
-  isHiring: boolean;
+  isHiring: boolean | null;
   foundedYear: number;
   oneLiner: string;
+  sourceSentence: string;
   batch: string;
   isVerified: boolean;
   discoveredAt: Date;
@@ -50,6 +52,7 @@ const FounderSchema = new Schema<IFounder>(
     xHandle: { type: String, default: "" },
     linkedinUrl: { type: String, default: "" },
     personalWebsiteUrl: { type: String, default: "" },
+    email: { type: String, default: "" },
     companyXUrl: { type: String, default: "" },
     companyLinkedinUrl: { type: String, default: "" },
     companyWebsiteUrl: { type: String, default: "" },
@@ -57,9 +60,10 @@ const FounderSchema = new Schema<IFounder>(
     companySlug: { type: String, default: "" },
     companyLogoUrl: { type: String, default: "" },
     teamSize: { type: Number, default: 0 },
-    isHiring: { type: Boolean, default: false },
+    isHiring: { type: Boolean, default: null },
     foundedYear: { type: Number, default: 0 },
     oneLiner: { type: String, default: "" },
+    sourceSentence: { type: String, default: "" },
     batch: { type: String, default: "" },
     isVerified: { type: Boolean, default: false },
     discoveredAt: { type: Date, default: Date.now },

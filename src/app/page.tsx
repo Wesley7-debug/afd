@@ -46,8 +46,10 @@ interface FilterState {
   roles: string[];
   countries: string[];
   foundedYears: number[];
+  foundedYearRange: string;
   hasX: boolean;
   isHiring: boolean;
+  notHiring: boolean;
   hasBio: boolean;
 }
 
@@ -57,6 +59,7 @@ function HomeContent() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   const [founders, setFounders] = useState<FounderData[]>([]);
+  const [filteredIds, setFilteredIds] = useState<string[] | null>(null);
   const [pagination, setPagination] = useState<PaginationData | null>(null);
   const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -73,8 +76,10 @@ function HomeContent() {
     roles: [],
     countries: [],
     foundedYears: [],
+    foundedYearRange: "",
     hasX: false,
     isHiring: false,
+    notHiring: false,
     hasBio: false,
   });
 
@@ -144,6 +149,11 @@ function HomeContent() {
       const data = await res.json();
       setFounders(data.founders || []);
       setPagination(data.pagination || null);
+
+      fetch(`/api/founders/ids?${params.toString()}`)
+        .then((r) => r.json())
+        .then((d) => setFilteredIds(Array.isArray(d.ids) ? d.ids : []))
+        .catch(() => setFilteredIds(null));
     } catch {
       setFounders([]);
     } finally {
@@ -199,23 +209,32 @@ function HomeContent() {
     setSelectedFounder(null);
   }, [searchParams, router]);
 
+  const navigationIds =
+    filteredIds && filteredIds.length > 0
+      ? filteredIds
+      : founders.map((f) => f._id);
+
   const handlePrevFounder = useCallback(() => {
-    if (!selectedId || founders.length === 0) return;
-    const currentIdx = founders.findIndex((f) => f._id === selectedId);
+    if (!selectedId || navigationIds.length === 0) return;
+    const currentIdx = navigationIds.indexOf(selectedId);
     if (currentIdx > 0) {
-      const prevFounder = founders[currentIdx - 1];
-      handleSelect(prevFounder._id);
+      const prevId = navigationIds[currentIdx - 1];
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("founder", prevId);
+      router.push(`/?${params.toString()}`, { scroll: false });
     }
-  }, [selectedId, founders, handleSelect]);
+  }, [selectedId, navigationIds, searchParams, router]);
 
   const handleNextFounder = useCallback(() => {
-    if (!selectedId || founders.length === 0) return;
-    const currentIdx = founders.findIndex((f) => f._id === selectedId);
-    if (currentIdx < founders.length - 1) {
-      const nextFounder = founders[currentIdx + 1];
-      handleSelect(nextFounder._id);
+    if (!selectedId || navigationIds.length === 0) return;
+    const currentIdx = navigationIds.indexOf(selectedId);
+    if (currentIdx >= 0 && currentIdx < navigationIds.length - 1) {
+      const nextId = navigationIds[currentIdx + 1];
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("founder", nextId);
+      router.push(`/?${params.toString()}`, { scroll: false });
     }
-  }, [selectedId, founders, handleSelect]);
+  }, [selectedId, navigationIds, searchParams, router]);
 
   const handlePageChange = useCallback(
     (newPage: number) => {
@@ -290,7 +309,13 @@ function HomeContent() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [navigateUp, navigateDown, selectedId]);
 
-  const currentFounderIndex = selectedId ? founders.findIndex((f) => f._id === selectedId) : -1;
+  const currentFounderIndex = selectedId
+    ? navigationIds.indexOf(selectedId)
+    : -1;
+  const filteredTotal =
+    filteredIds && filteredIds.length > 0
+      ? filteredIds.length
+      : pagination?.total || founders.length;
 
   return (
     <div className="mx-auto flex min-h-[calc(100vh-48px)] w-full max-w-[1440px] flex-col gap-4 px-8 py-6 max-md:px-4 max-md:py-5">
@@ -433,7 +458,7 @@ function HomeContent() {
         <FounderModal
           founder={selectedFounder}
           currentIndex={currentFounderIndex >= 0 ? currentFounderIndex : 0}
-          totalCount={pagination?.total || founders.length}
+          totalCount={filteredTotal}
           onClose={handleCloseModal}
           onPrev={handlePrevFounder}
           onNext={handleNextFounder}

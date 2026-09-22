@@ -1,7 +1,8 @@
 import mongoose from "mongoose";
 import * as cheerio from "cheerio";
 import { connectDB } from "@/lib/mongodb";
-import { Founder, Company, CrawlSource, CrawlJob, CrawlProgress } from "@/models";
+import { Founder, Company, CrawlSource, CrawlUrlQueue, CrawlJob } from "@/models";
+import type { ICrawlUrlQueue } from "@/models/CrawlUrlQueue";
 import {
   isSameDomain,
   normalizeUrl,
@@ -11,60 +12,35 @@ import {
   normalizeCompanyName,
   generateSlug,
 } from "@/lib/utils";
-import { detectFoundersOnPage, DetectedFounder } from "./detector";
+import { detectFoundersOnPage, DetectedFounder, PageExtraction } from "./detector";
 import {
   URL_PRIORITY_KEYWORDS,
   URL_DEPRIORITIZE_PATTERNS,
   PAGE_CONTENT_KEYWORDS,
-  detectCountry,
 } from "./africa-config";
 
-interface CrawlerConfig {
-  maxDepth: number;
-  maxPages: number;
-  requestTimeout: number;
-  retryLimit: number;
-  delayBetweenRequests: number;
-  maxResponseSize: number;
+const REQUEST_TIMEOUT_MS = 20000;
+const RETRY_LIMIT = 3;
+const MIN_HOST_GAP_MS = 1200;
+const MAX_RESPONSE_SIZE = 5 * 1024 * 1024;
+const MAX_QUEUE_ATTEMPTS = 5;
+const STALE_CRAWLING_MS = 15 * 60 * 1000;
+const USER_AGENT = "AfricanFoundersBot/1.0 (+https://africanfounders.com/bot)";
+
+interface RobotsRule {
+  disallowed: string[];
+  crawlDelay: number;
+  fetchedAt: number;
 }
 
-const DEFAULT_CONFIG: CrawlerConfig = {
-  maxDepth: 8,
-  maxPages: 1000,
-  requestTimeout: 20000,
-  retryLimit: 3,
-  delayBetweenRequests: 1500,
-  maxResponseSize: 5 * 1024 * 1024,
-};
+const robotsCache = new Map<string, RobotsRule>();
+const lastHostFetch = new Map<string, number>();
 
-const PER_SITE_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes per site
-const PROGRESS_SAVE_INTERVAL = 10; // save state every N pages
-
-interface CrawlQueueEntry {
-  url: string;
-  depth: number;
-  priority: number;
-  reason: string;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface CrawlState {
-  visited: Set<string>;
-  queue: CrawlQueueEntry[];
-  pagesCrawled: number;
-  pagesSkipped: number;
-  foundersFound: number;
-  newFounders: number;
-  updatedFounders: number;
-  duplicatesFound: number;
-  fundingPagesFound: number;
-  hiringPagesFound: number;
-  founderProfilesFound: number;
-  companiesDiscovered: number;
-  countriesDiscovered: Set<string>;
-  errors: string[];
-}
-
-function scoreUrl(url: string, pageText: string = ""): { score: number; reason: string } {
+export function scoreUrl(url: string, pageText: string = ""): { score: number; reason: string } {
   let score = 0;
   let reason = "default";
 
@@ -106,229 +82,207 @@ function scoreUrl(url: string, pageText: string = ""): { score: number; reason: 
   return { score: Math.max(0, score), reason };
 }
 
-function insertByPriority(queue: CrawlQueueEntry[], entry: CrawlQueueEntry): void {
-  let low = 0;
-  let high = queue.length;
-  while (low < high) {
-    const mid = (low + high) >>> 1;
-    if (queue[mid].priority >= entry.priority) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-  queue.splice(low, 0, entry);
-}
-
-async function saveProgress(
-  sourceId: mongoose.Types.ObjectId,
-  state: CrawlState
-): Promise<void> {
+export async function enqueueUrl(params: {
+  url: string;
+  sourceId: mongoose.Types.ObjectId;
+  depth: number;
+  priority: number;
+  reason: string;
+}): Promise<void> {
   try {
-    await CrawlProgress.findOneAndUpdate(
-      { sourceId },
+    await CrawlUrlQueue.updateOne(
+      { url: params.url },
       {
-        sourceId,
-        visitedUrls: [...state.visited],
-        queue: state.queue.map((e) => ({
-          url: e.url,
-          depth: e.depth,
-          priority: e.priority,
-          reason: e.reason,
-        })),
-        pagesCrawled: state.pagesCrawled,
-        pagesSkipped: state.pagesSkipped,
-        foundersFound: state.foundersFound,
-        newFounders: state.newFounders,
-        updatedFounders: state.updatedFounders,
-        duplicatesFound: state.duplicatesFound,
-        fundingPagesFound: state.fundingPagesFound,
-        hiringPagesFound: state.hiringPagesFound,
-        founderProfilesFound: state.founderProfilesFound,
-        companiesDiscovered: state.companiesDiscovered,
-        countriesDiscovered: [...state.countriesDiscovered],
-        crawlErrors: state.errors,
-        lastSavedAt: new Date(),
+        $max: { priority: params.priority },
+        $setOnInsert: {
+          sourceId: params.sourceId,
+          depth: params.depth,
+          status: "queued",
+          attempts: 0,
+          reason: params.reason,
+          nextAttemptAt: new Date(),
+          discoveredAt: new Date(),
+        },
       },
       { upsert: true }
     );
-  } catch {
-    // save failed, continue silently
+  } catch (error) {
+    const code = (error as { code?: number })?.code;
+    if (code !== 11000) throw error;
   }
 }
 
-async function clearProgress(sourceId: mongoose.Types.ObjectId): Promise<void> {
+export async function claimNextUrl(): Promise<ICrawlUrlQueue | null> {
+  await connectDB();
+  const now = new Date();
   try {
-    await CrawlProgress.deleteOne({ sourceId });
-  } catch {
-    // clear failed, continue silently
-  }
-}
-
-async function loadProgress(
-  sourceId: mongoose.Types.ObjectId
-): Promise<CrawlState | null> {
-  try {
-    const saved = await CrawlProgress.findOne({ sourceId });
-    if (!saved) return null;
-
-    return {
-      visited: new Set(saved.visitedUrls),
-      queue: saved.queue.map((e) => ({
-        url: e.url,
-        depth: e.depth,
-        priority: e.priority,
-        reason: e.reason,
-      })),
-      pagesCrawled: saved.pagesCrawled,
-      pagesSkipped: saved.pagesSkipped,
-      foundersFound: saved.foundersFound,
-      newFounders: saved.newFounders,
-      updatedFounders: saved.updatedFounders,
-      duplicatesFound: saved.duplicatesFound,
-      fundingPagesFound: saved.fundingPagesFound,
-      hiringPagesFound: saved.hiringPagesFound,
-      founderProfilesFound: saved.founderProfilesFound,
-      companiesDiscovered: saved.companiesDiscovered,
-      countriesDiscovered: new Set(saved.countriesDiscovered),
-      errors: saved.crawlErrors,
-    };
+    return await CrawlUrlQueue.findOneAndUpdate(
+      { status: "queued", nextAttemptAt: { $lte: now } },
+      { $set: { status: "crawling", lastAttemptAt: now }, $inc: { attempts: 1 } },
+      { sort: { priority: -1, discoveredAt: 1 }, new: true }
+    );
   } catch {
     return null;
   }
 }
 
-async function fetchPage(
-  url: string,
-  config: CrawlerConfig
-): Promise<{ html: string; contentType: string } | null> {
-  for (let attempt = 0; attempt < config.retryLimit; attempt++) {
+async function completeUrl(id: mongoose.Types.ObjectId, sourceId: mongoose.Types.ObjectId): Promise<void> {
+  await CrawlUrlQueue.updateOne(
+    { _id: id },
+    { $set: { status: "completed", completedAt: new Date(), errorMessage: "" } }
+  );
+  await CrawlSource.updateOne(
+    { _id: sourceId },
+    { $set: { lastActivityAt: new Date() }, $inc: { pagesCrawled: 1 } }
+  );
+}
+
+async function failUrl(
+  id: mongoose.Types.ObjectId,
+  attempts: number,
+  message: string
+): Promise<void> {
+  if (attempts >= MAX_QUEUE_ATTEMPTS) {
+    await CrawlUrlQueue.updateOne(
+      { _id: id },
+      { $set: { status: "failed", errorMessage: message, completedAt: new Date() } }
+    );
+    return;
+  }
+  const backoffMs = Math.min(Math.pow(2, attempts) * 30000, 30 * 60 * 1000);
+  await CrawlUrlQueue.updateOne(
+    { _id: id },
+    {
+      $set: {
+        status: "queued",
+        errorMessage: message,
+        nextAttemptAt: new Date(Date.now() + backoffMs),
+      },
+    }
+  );
+}
+
+export async function recoverStaleUrls(): Promise<void> {
+  const cutoff = new Date(Date.now() - STALE_CRAWLING_MS);
+  await CrawlUrlQueue.updateMany(
+    { status: "crawling", lastAttemptAt: { $lt: cutoff } },
+    { $set: { status: "queued", nextAttemptAt: new Date() } }
+  );
+}
+
+async function addRejection(sourceId: mongoose.Types.ObjectId, reason: string): Promise<void> {
+  const res = await CrawlSource.updateOne(
+    { _id: sourceId, "rejectionCounts.reason": { $ne: reason } },
+    { $push: { rejectionCounts: { reason, count: 1 } } }
+  );
+  if (res.modifiedCount === 0) {
+    await CrawlSource.updateOne(
+      { _id: sourceId, "rejectionCounts.reason": reason },
+      { $inc: { "rejectionCounts.$.count": 1 } }
+    );
+  }
+}
+
+async function fetchPage(url: string): Promise<string | null> {
+  for (let attempt = 0; attempt < RETRY_LIMIT; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), config.requestTimeout);
-
+      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
       const response = await fetch(url, {
         headers: {
-          "User-Agent": "AfricanFoundersBot/1.0 (+https://africanfounders.com/bot)",
+          "User-Agent": USER_AGENT,
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Language": "en-US,en;q=0.5",
         },
         signal: controller.signal,
         redirect: "follow",
       });
-
       clearTimeout(timeout);
 
-      if (!response.ok) {
-        return null;
-      }
+      if (!response.ok) return null;
 
       const contentType = response.headers.get("content-type") || "";
-      if (!contentType.includes("text/html") && !contentType.includes("application/xhtml")) {
-        return null;
-      }
+      if (!contentType.includes("text/html") && !contentType.includes("application/xhtml")) return null;
 
       const contentLength = response.headers.get("content-length");
-      if (contentLength && parseInt(contentLength) > config.maxResponseSize) {
-        return null;
-      }
+      if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) return null;
 
       const html = await response.text();
-      if (html.length > config.maxResponseSize) {
-        return null;
-      }
-
-      return { html, contentType };
+      if (html.length > MAX_RESPONSE_SIZE) return null;
+      return html;
     } catch {
-      if (attempt === config.retryLimit - 1) {
-        return null;
-      }
-      await new Promise((resolve) =>
-        setTimeout(resolve, config.delayBetweenRequests * (attempt + 1))
-      );
+      if (attempt === RETRY_LIMIT - 1) return null;
+      await sleep(1000 * (attempt + 1));
     }
   }
   return null;
 }
 
-async function checkRobotsTxt(
-  baseUrl: string,
-  config: CrawlerConfig
-): Promise<{ disallowed: string[]; crawlDelay: number }> {
+async function checkRobots(baseUrl: string): Promise<RobotsRule> {
+  let host = "";
+  try {
+    host = new URL(baseUrl).hostname;
+  } catch {
+    return { disallowed: [], crawlDelay: 1, fetchedAt: Date.now() };
+  }
+
+  const cached = robotsCache.get(host);
+  if (cached && Date.now() - cached.fetchedAt < 60 * 60 * 1000) return cached;
+
+  const rule: RobotsRule = { disallowed: [], crawlDelay: 1, fetchedAt: Date.now() };
   try {
     const urlObj = new URL(baseUrl);
-    const robotsUrl = `${urlObj.origin}/robots.txt`;
-    const result = await fetchPage(robotsUrl, { ...config, maxPages: 1 });
-
-    if (!result) {
-      return { disallowed: [], crawlDelay: 1 };
-    }
-
-    const lines = result.html.split("\n");
-    const disallowed: string[] = [];
-    let crawlDelay = 1;
-    let userAgentMatch = false;
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("User-agent:") || trimmed.startsWith("User-Agent:")) {
-        const agent = trimmed.split(":")[1].trim();
-        userAgentMatch = agent === "*" || agent.toLowerCase().includes("bot");
-      }
-      if (userAgentMatch) {
-        if (trimmed.startsWith("Disallow:")) {
-          const path = trimmed.split(":")[1].trim();
-          if (path) disallowed.push(path);
-        }
-        if (trimmed.startsWith("Crawl-delay:")) {
-          crawlDelay = parseFloat(trimmed.split(":")[1].trim()) || 1;
+    const html = await fetchPage(`${urlObj.origin}/robots.txt`);
+    if (html) {
+      let match = false;
+      for (const line of html.split("\n")) {
+        const trimmed = line.trim();
+        if (/^user-agent:/i.test(trimmed)) {
+          const agent = trimmed.split(":")[1].trim();
+          match = agent === "*" || agent.toLowerCase().includes("bot");
+        } else if (match && /^disallow:/i.test(trimmed)) {
+          const path = trimmed.split(/:/i).slice(1).join(":").trim();
+          if (path) rule.disallowed.push(path);
+        } else if (match && /^crawl-delay:/i.test(trimmed)) {
+          rule.crawlDelay = parseFloat(trimmed.split(":")[1].trim()) || 1;
         }
       }
     }
-
-    return { disallowed, crawlDelay: Math.max(crawlDelay, 1) };
-  } catch {
-    return { disallowed: [], crawlDelay: 1 };
-  }
+  } catch {}
+  robotsCache.set(host, rule);
+  return rule;
 }
 
 function isAllowedByRobots(url: string, disallowed: string[]): boolean {
   try {
-    const urlObj = new URL(url);
-    return !disallowed.some((path) => urlObj.pathname.startsWith(path));
+    const path = new URL(url).pathname;
+    return !disallowed.some((p) => path.startsWith(p));
   } catch {
     return true;
   }
 }
 
-function extractLinks(
-  $: cheerio.CheerioAPI,
-  pageUrl: string,
-  baseUrl: string
-): string[] {
-  const links: string[] = [];
-  const urlObj = new URL(baseUrl);
+async function respectHostGap(url: string): Promise<void> {
+  try {
+    const host = new URL(url).hostname;
+    const last = lastHostFetch.get(host) || 0;
+    const wait = last + MIN_HOST_GAP_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastHostFetch.set(host, Date.now());
+  } catch {}
+}
 
+function extractLinks($: cheerio.CheerioAPI, pageUrl: string, baseUrl: string): string[] {
+  const links: string[] = [];
   $('a[href]').each((_, el) => {
     const href = $(el).attr("href");
     if (!href) return;
-
     const normalized = normalizeUrl(href, pageUrl);
-
     if (!isValidUrl(normalized)) return;
     if (!isSameDomain(normalized, baseUrl)) return;
     if (shouldSkipUrl(normalized)) return;
-
-    try {
-      const linkUrl = new URL(normalized);
-      if (linkUrl.hostname !== urlObj.hostname) return;
-    } catch {
-      return;
-    }
-
     links.push(normalized);
   });
-
   return [...new Set(links)];
 }
 
@@ -339,125 +293,176 @@ function extractFounderProfileLinks(
   founderNames: string[]
 ): string[] {
   const links: string[] = [];
-
   $('a[href]').each((_, el) => {
     const href = $(el).attr("href");
     if (!href) return;
-
     const normalized = normalizeUrl(href, pageUrl);
     if (!isValidUrl(normalized) || !isSameDomain(normalized, baseUrl)) return;
 
-    const linkText = $(el).text().toLowerCase();
-    const linkPath = new URL(normalized).pathname.toLowerCase();
+    const linkText = ($(el).text() || "").toLowerCase();
+    let linkPath = "";
+    try {
+      linkPath = new URL(normalized).pathname.toLowerCase();
+    } catch {
+      return;
+    }
 
     for (const name of founderNames) {
       const nameLower = name.toLowerCase();
       const nameSlug = nameLower.replace(/\s+/g, "-");
-
+      const nameCompact = nameLower.replace(/\s+/g, "");
       if (
+        linkPath.includes(`/team/${nameSlug}`) ||
+        linkPath.includes(`/people/${nameSlug}`) ||
+        linkPath.includes(`/founders/${nameSlug}`) ||
         linkPath.includes(nameSlug) ||
-        linkPath.includes(nameLower.replace(/\s+/g, "")) ||
-        linkText.includes(nameLower)
+        linkPath.includes(nameCompact) ||
+        linkText === nameLower
       ) {
         links.push(normalized);
       }
     }
   });
-
   return [...new Set(links)];
 }
 
-async function saveFounderToDb(
-  detected: DetectedFounder
-): Promise<{ isNew: boolean; isDuplicate: boolean; founderId?: mongoose.Types.ObjectId }> {
-  await connectDB();
+async function findCompanyWebsiteLink(
+  $: cheerio.CheerioAPI,
+  companyName: string,
+  pageUrl: string
+): Promise<string> {
+  const pageHost = new URL(pageUrl).hostname.replace(/^www\./, "");
+  const compact = companyName.toLowerCase().replace(/[^a-z0-9]/g, "");
+  let found = "";
 
+  $("a[href]").each((_, el) => {
+    if (found) return;
+    const href = $(el).attr("href") || "";
+    if (!/^https?:\/\//i.test(href)) return;
+    const lower = href.toLowerCase();
+    if (
+      lower.includes("linkedin.com") ||
+      lower.includes("twitter.com") ||
+      lower.includes("x.com") ||
+      lower.includes("facebook.com") ||
+      lower.includes("instagram.com") ||
+      lower.includes("youtube.com")
+    ) {
+      return;
+    }
+    try {
+      const host = new URL(href).hostname.replace(/^www\./, "");
+      if (host === pageHost) return;
+      const anchor = ($(el).text() || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const hrefCompact = host.split(".")[0].toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (anchor === compact || hrefCompact === compact || host.replace(/[^a-z0-9]/g, "").includes(compact)) {
+        found = href;
+      }
+    } catch {}
+  });
+
+  return found;
+}
+
+async function saveFounderToDb(
+  detected: DetectedFounder,
+  companyHiring: { hiring: boolean | null; evidence: string }
+): Promise<{ isNew: boolean; founderId: mongoose.Types.ObjectId }> {
+  await connectDB();
   const normalizedName = normalizeFounderName(detected.name);
   const slug = generateSlug(detected.name);
   const xHandle = detected.xUrl
     ? (detected.xUrl.match(/(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]+)/) || [])[1] || ""
     : "";
+  const bio = (detected.bio || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
 
-  const existingFounder = await Founder.findOne({
-    $or: [
-      { normalizedName },
-      ...(detected.xUrl ? [{ xUrl: detected.xUrl }] : []),
-      ...(detected.linkedinUrl ? [{ linkedinUrl: detected.linkedinUrl }] : []),
-    ],
-  });
+  const identifierOr: Record<string, string>[] = [];
+  if (xHandle) identifierOr.push({ xHandle });
+  if (detected.xUrl) identifierOr.push({ xUrl: detected.xUrl });
+  if (detected.linkedinUrl) identifierOr.push({ linkedinUrl: detected.linkedinUrl });
+  if (detected.personalWebsiteUrl) identifierOr.push({ personalWebsiteUrl: detected.personalWebsiteUrl });
+  if (detected.email) identifierOr.push({ email: detected.email });
 
-  if (existingFounder) {
+  let existing = identifierOr.length
+    ? await Founder.findOne({ $or: identifierOr })
+    : null;
+  if (!existing) existing = await Founder.findOne({ normalizedName });
+
+  if (existing) {
     let updated = false;
-
-    if (!existingFounder.linkedinUrl && detected.linkedinUrl) {
-      existingFounder.linkedinUrl = detected.linkedinUrl;
+    if (!existing.linkedinUrl && detected.linkedinUrl) {
+      existing.linkedinUrl = detected.linkedinUrl;
       updated = true;
     }
-    if (!existingFounder.xUrl && detected.xUrl) {
-      existingFounder.xUrl = detected.xUrl;
+    if (!existing.xUrl && detected.xUrl) {
+      existing.xUrl = detected.xUrl;
       updated = true;
     }
-    if (!existingFounder.xHandle && xHandle) {
-      existingFounder.xHandle = xHandle;
+    if (!existing.xHandle && xHandle) {
+      existing.xHandle = xHandle;
       updated = true;
     }
-    if (!existingFounder.personalWebsiteUrl && detected.personalWebsiteUrl) {
-      existingFounder.personalWebsiteUrl = detected.personalWebsiteUrl;
+    if (!existing.personalWebsiteUrl && detected.personalWebsiteUrl) {
+      existing.personalWebsiteUrl = detected.personalWebsiteUrl;
       updated = true;
     }
-    if (!existingFounder.companyXUrl && detected.companyXUrl) {
-      existingFounder.companyXUrl = detected.companyXUrl;
+    if (!existing.email && detected.email) {
+      existing.email = detected.email;
       updated = true;
     }
-    if (!existingFounder.companyLinkedinUrl && detected.companyLinkedinUrl) {
-      existingFounder.companyLinkedinUrl = detected.companyLinkedinUrl;
+    if (!existing.companyWebsiteUrl && detected.companyWebsiteUrl) {
+      existing.companyWebsiteUrl = detected.companyWebsiteUrl;
       updated = true;
     }
-    if (!existingFounder.companyWebsiteUrl && detected.companyWebsiteUrl) {
-      existingFounder.companyWebsiteUrl = detected.companyWebsiteUrl;
+    if (!existing.bio && bio) {
+      existing.bio = bio;
       updated = true;
     }
-    if (!existingFounder.bio && detected.bio) {
-      existingFounder.bio = detected.bio.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+    if (!existing.sourceSentence && detected.sourceSentence) {
+      existing.sourceSentence = detected.sourceSentence;
       updated = true;
     }
-    if (!existingFounder.location && detected.location) {
-      existingFounder.location = detected.location;
+    if (!existing.location && detected.location) {
+      existing.location = detected.location;
       updated = true;
     }
-    if (detected.country && (!existingFounder.country || existingFounder.country === "Nigeria" && detected.country !== "Nigeria")) {
-      existingFounder.country = detected.country;
+    if (!existing.country && detected.country) {
+      existing.country = detected.country;
       updated = true;
     }
-    if (!existingFounder.industry && detected.industry) {
-      existingFounder.industry = detected.industry;
+    if (!existing.industry && detected.industry) {
+      existing.industry = detected.industry;
       updated = true;
     }
-    if (!existingFounder.oneLiner && detected.oneLiner) {
-      existingFounder.oneLiner = detected.oneLiner;
+    if (!existing.oneLiner && detected.oneLiner) {
+      existing.oneLiner = detected.oneLiner;
       updated = true;
     }
-    if (detected.teamSize > 0 && existingFounder.teamSize === 0) {
-      existingFounder.teamSize = detected.teamSize;
+    if (detected.teamSize > 0 && existing.teamSize === 0) {
+      existing.teamSize = detected.teamSize;
       updated = true;
     }
-    if (detected.isHiring && !existingFounder.isHiring) {
-      existingFounder.isHiring = true;
+    if (companyHiring.hiring === true && existing.isHiring !== true) {
+      existing.isHiring = true;
+      updated = true;
+    } else if (
+      companyHiring.hiring === false &&
+      (existing.isHiring === null || existing.isHiring === undefined)
+    ) {
+      existing.isHiring = false;
       updated = true;
     }
-    if (detected.foundedYear > 0 && existingFounder.foundedYear === 0) {
-      existingFounder.foundedYear = detected.foundedYear;
+    if (detected.foundedYear > 0 && existing.foundedYear === 0) {
+      existing.foundedYear = detected.foundedYear;
       updated = true;
     }
-    if (detected.role && !existingFounder.role) {
-      existingFounder.role = detected.role;
+    if (detected.role && !existing.role) {
+      existing.role = detected.role;
       updated = true;
     }
-
-    existingFounder.lastVerifiedAt = new Date();
-    if (updated) await existingFounder.save();
-
-    return { isNew: false, isDuplicate: true, founderId: existingFounder._id as mongoose.Types.ObjectId };
+    existing.lastVerifiedAt = new Date();
+    if (updated) await existing.save();
+    return { isNew: false, founderId: existing._id as mongoose.Types.ObjectId };
   }
 
   const newFounder = new Founder({
@@ -465,7 +470,7 @@ async function saveFounderToDb(
     normalizedName,
     slug,
     role: detected.role,
-    bio: detected.bio.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim(),
+    bio,
     location: detected.location,
     country: detected.country || "",
     industry: detected.industry,
@@ -475,707 +480,458 @@ async function saveFounderToDb(
     xHandle,
     linkedinUrl: detected.linkedinUrl,
     personalWebsiteUrl: detected.personalWebsiteUrl,
-    companyXUrl: detected.companyXUrl,
-    companyLinkedinUrl: detected.companyLinkedinUrl,
+    email: detected.email || "",
     companyWebsiteUrl: detected.companyWebsiteUrl,
     companies: [],
     oneLiner: detected.oneLiner,
+    sourceSentence: detected.sourceSentence || "",
     teamSize: detected.teamSize,
-    isHiring: detected.isHiring,
+    isHiring: companyHiring.hiring,
     foundedYear: detected.foundedYear,
     discoveredAt: new Date(),
     lastVerifiedAt: new Date(),
   });
-
   await newFounder.save();
-  return { isNew: true, isDuplicate: false, founderId: newFounder._id as mongoose.Types.ObjectId };
+  return { isNew: true, founderId: newFounder._id as mongoose.Types.ObjectId };
 }
 
-async function saveCompanyToDb(
+async function linkFounderToCompany(
+  founderId: mongoose.Types.ObjectId,
+  companyId: mongoose.Types.ObjectId
+): Promise<"created" | "duplicate"> {
+  const founder = await Founder.findById(founderId);
+  if (!founder) return "duplicate";
+  if (founder.companies.some((c) => String(c) === String(companyId))) return "duplicate";
+
+  founder.companies.push(companyId);
+  await founder.save();
+
+  const company = await Company.findById(companyId);
+  if (company && !company.founders.some((f) => String(f) === String(founderId))) {
+    company.founders.push(founderId);
+    await company.save();
+  }
+  return "created";
+}
+
+async function saveCompanyForFounder(
   companyName: string,
   founderId: mongoose.Types.ObjectId,
-  detected?: DetectedFounder
-): Promise<{ isNew: boolean; isDuplicate: boolean; companyId?: mongoose.Types.ObjectId }> {
+  detected: DetectedFounder,
+  sourceId: mongoose.Types.ObjectId,
+  websiteUrl: string,
+  companyHiring: { hiring: boolean | null; evidence: string }
+): Promise<{ isNew: boolean; linked: "created" | "duplicate" }> {
   await connectDB();
-
   const normalizedName = normalizeCompanyName(companyName);
   const slug = generateSlug(companyName);
 
-  const existingCompany = await Company.findOne({ normalizedName });
+  let company = await Company.findOne({ normalizedName });
+  let isNew = false;
 
-  if (existingCompany) {
-    if (!existingCompany.founders.includes(founderId)) {
-      existingCompany.founders.push(founderId);
-      if (detected?.isHiring && !existingCompany.isHiring) existingCompany.isHiring = true;
-      if (detected?.foundedYear && !existingCompany.foundedYear) existingCompany.foundedYear = detected.foundedYear;
-      if (detected?.industry && !existingCompany.industry) existingCompany.industry = detected.industry;
-      if (detected?.location && !existingCompany.location) existingCompany.location = detected.location;
-      if (detected?.country && (!existingCompany.country || existingCompany.country === "Nigeria" && detected.country !== "Nigeria")) {
-        existingCompany.country = detected.country;
+  if (!company) {
+    company = new Company({
+      name: companyName,
+      normalizedName,
+      slug,
+      founders: [],
+      country: detected.country || "",
+      industry: detected.industry || "",
+      location: detected.location || "",
+      foundedYear: detected.foundedYear || 0,
+      isHiring: companyHiring.hiring,
+      hiringEvidence: companyHiring.evidence || "",
+      websiteUrl: websiteUrl || "",
+    });
+    await company.save();
+    isNew = true;
+    await CrawlSource.updateOne({ _id: sourceId }, { $inc: { companiesDiscovered: 1 } });
+  } else {
+    let updated = false;
+    if (!company.foundedYear && detected.foundedYear) {
+      company.foundedYear = detected.foundedYear;
+      updated = true;
+    }
+    if (companyHiring.hiring === true && company.isHiring !== true) {
+      company.isHiring = true;
+      company.hiringEvidence = companyHiring.evidence || company.hiringEvidence || "";
+      updated = true;
+    } else if (
+      companyHiring.hiring === false &&
+      (company.isHiring === null || company.isHiring === undefined)
+    ) {
+      company.isHiring = false;
+      company.hiringEvidence = companyHiring.evidence || "";
+      updated = true;
+    }
+    if (!company.industry && detected.industry) {
+      company.industry = detected.industry;
+      updated = true;
+    }
+    if (!company.location && detected.location) {
+      company.location = detected.location;
+      updated = true;
+    }
+    if (!company.country && detected.country) {
+      company.country = detected.country;
+      updated = true;
+    }
+    if (!company.websiteUrl && websiteUrl) {
+      company.websiteUrl = websiteUrl;
+      updated = true;
+    }
+    if (updated) await company.save();
+  }
+
+  const linked = await linkFounderToCompany(founderId, company._id as mongoose.Types.ObjectId);
+  return { isNew, linked };
+}
+
+function namesLooselyMatch(a: string, b: string): boolean {
+  const na = normalizeCompanyName(a);
+  const nb = normalizeCompanyName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (Math.min(na.length, nb.length) < 5) return false;
+  return na.includes(nb) || nb.includes(na);
+}
+
+function resolveCompanyHiring(
+  extraction: PageExtraction,
+  companyName: string
+): { hiring: boolean | null; evidence: string } {
+  if (extraction.hiring === null || !extraction.hiringCompanyHint) {
+    return { hiring: null, evidence: "" };
+  }
+  if (!namesLooselyMatch(extraction.hiringCompanyHint, companyName)) {
+    return { hiring: null, evidence: "" };
+  }
+  return { hiring: extraction.hiring, evidence: extraction.hiringEvidence };
+}
+
+async function getCycleBudget(sourceId: mongoose.Types.ObjectId, maxPages: number, cycleStart: Date): Promise<number> {
+  const [completed, pending] = await Promise.all([
+    CrawlUrlQueue.countDocuments({ sourceId, status: "completed", completedAt: { $gte: cycleStart } }),
+    CrawlUrlQueue.countDocuments({ sourceId, status: { $in: ["queued", "crawling"] } }),
+  ]);
+  return Math.max(0, maxPages - completed - pending);
+}
+
+export async function processQueueEntry(entry: ICrawlUrlQueue): Promise<void> {
+  await connectDB();
+  const source = await CrawlSource.findById(entry.sourceId);
+  if (!source) {
+    await failUrl(entry._id as mongoose.Types.ObjectId, entry.attempts, "Source missing");
+    return;
+  }
+
+  const entryId = entry._id as mongoose.Types.ObjectId;
+  const maxDepth = source.maxDepth || 8;
+
+  try {
+    const baseHost = new URL(source.baseUrl).hostname;
+    const urlHost = new URL(entry.url).hostname;
+    if (baseHost !== urlHost) {
+      await failUrl(entryId, entry.attempts, "Off-source host");
+      return;
+    }
+
+    const robots = await checkRobots(source.baseUrl);
+    if (!isAllowedByRobots(entry.url, robots.disallowed)) {
+      await completeUrl(entryId, source._id as mongoose.Types.ObjectId);
+      return;
+    }
+
+    await respectHostGap(entry.url);
+    const html = await fetchPage(entry.url);
+    if (!html) {
+      await failUrl(entryId, entry.attempts, "Fetch failed");
+      return;
+    }
+
+    const $ = cheerio.load(html);
+    const bodyText = $("body").text() || "";
+    const extraction: PageExtraction = detectFoundersOnPage($, html, entry.url, {
+      sourceName: source.name,
+    });
+
+    await CrawlSource.updateOne(
+      { _id: source._id },
+      { $set: { lastActivityAt: new Date() } }
+    );
+
+    for (const reason of extraction.rejectionLog) {
+      await addRejection(source._id as mongoose.Types.ObjectId, reason);
+    }
+
+    const founderNames: string[] = [];
+
+    for (const detected of extraction.founders) {
+      founderNames.push(detected.name);
+      await CrawlSource.updateOne(
+        { _id: source._id },
+        { $inc: { founderCandidates: 1 } }
+      );
+
+      if (detected.country) {
+        // country recorded via founder save; nothing else needed here
       }
-      await existingCompany.save();
 
-      const founder = await Founder.findById(founderId);
-      if (founder && !founder.companies.includes(existingCompany._id)) {
-        founder.companies.push(existingCompany._id);
-        founder.companySlug = existingCompany.slug;
-        if (existingCompany.logoUrl) founder.companyLogoUrl = existingCompany.logoUrl;
-        if (existingCompany.teamSize) founder.teamSize = existingCompany.teamSize;
-        if (existingCompany.isHiring) founder.isHiring = existingCompany.isHiring;
-        if (existingCompany.foundedYear && !founder.foundedYear) founder.foundedYear = existingCompany.foundedYear;
-        await founder.save();
+      const companyHiring = detected.company
+        ? resolveCompanyHiring(extraction, detected.company)
+        : { hiring: null, evidence: "" };
+
+      const founderResult = await saveFounderToDb(detected, companyHiring);
+      if (founderResult.isNew) {
+        await CrawlSource.updateOne(
+          { _id: source._id },
+          { $inc: { foundersDiscovered: 1 } }
+        );
+      }
+
+      if (!detected.company) {
+        await CrawlSource.updateOne(
+          { _id: source._id },
+          { $inc: { relationshipsRejected: 1 } }
+        );
+        continue;
+      }
+
+      let websiteUrl = "";
+      if (extraction.primaryCompany) {
+        websiteUrl = await findCompanyWebsiteLink($, detected.company, entry.url);
+      }
+
+      const companyResult = await saveCompanyForFounder(
+        detected.company,
+        founderResult.founderId,
+        detected,
+        source._id as mongoose.Types.ObjectId,
+        websiteUrl,
+        companyHiring
+      );
+
+      if (companyResult.linked === "created") {
+        await CrawlSource.updateOne(
+          { _id: source._id },
+          { $inc: { relationshipsCreated: 1 } }
+        );
+      } else {
+        await CrawlSource.updateOne(
+          { _id: source._id },
+          { $inc: { relationshipsRejected: 1 } }
+        );
+        await addRejection(source._id as mongoose.Types.ObjectId, "Duplicate founder/company relationship");
       }
     }
 
-    return { isNew: false, isDuplicate: true, companyId: existingCompany._id as mongoose.Types.ObjectId };
+    const cycleStart = source.crawlCycleStartedAt || new Date(0);
+    const budget = await getCycleBudget(
+      source._id as mongoose.Types.ObjectId,
+      source.maxPages || 1000,
+      cycleStart
+    );
+
+    if (entry.depth < maxDepth && budget > 0) {
+      let linkBudget = budget;
+
+      if (founderNames.length > 0 && linkBudget > 0) {
+        const profileLinks = extractFounderProfileLinks($, entry.url, source.baseUrl, founderNames);
+        for (const link of profileLinks) {
+          if (linkBudget <= 0) break;
+          const { score } = scoreUrl(link);
+          await enqueueUrl({
+            url: link,
+            sourceId: source._id as mongoose.Types.ObjectId,
+            depth: entry.depth + 1,
+            priority: score + 40,
+            reason: "founder profile link",
+          });
+          linkBudget--;
+        }
+      }
+
+      const links = extractLinks($, entry.url, source.baseUrl);
+      const scored = links
+        .map((link) => ({ link, ...scoreUrl(link, bodyText) }))
+        .filter((x) => x.score > 0 || x.reason === "default")
+        .sort((a, b) => b.score - a.score);
+
+      for (const { link, score, reason } of scored) {
+        if (linkBudget <= 0) break;
+        await enqueueUrl({
+          url: link,
+          sourceId: source._id as mongoose.Types.ObjectId,
+          depth: entry.depth + 1,
+          priority: score,
+          reason,
+        });
+        linkBudget--;
+      }
+    }
+
+    await completeUrl(entryId, source._id as mongoose.Types.ObjectId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await failUrl(entryId, entry.attempts, message);
+    await CrawlSource.updateOne(
+      { _id: source._id },
+      {
+        $inc: { errorCount: 1 },
+        $push: { crawlErrors: `Error on ${entry.url}: ${message}` },
+      }
+    );
   }
-
-  const newCompany = new Company({
-    name: companyName,
-    normalizedName,
-    slug,
-    founders: [founderId],
-    country: detected?.country || "",
-    industry: detected?.industry || "",
-    location: detected?.location || "",
-    foundedYear: detected?.foundedYear || 0,
-    isHiring: detected?.isHiring || false,
-  });
-
-  await newCompany.save();
-
-  const founder = await Founder.findById(founderId);
-  if (founder) {
-    founder.companies.push(newCompany._id);
-    founder.companySlug = newCompany.slug;
-    await founder.save();
-  }
-
-  return { isNew: true, isDuplicate: false, companyId: newCompany._id as mongoose.Types.ObjectId };
 }
 
-export async function runCrawler(sourceId?: string): Promise<void> {
+export async function kickSources(opts?: {
+  sourceId?: string;
+  force?: boolean;
+}): Promise<{ enqueued: number }> {
   await connectDB();
 
-  const query = sourceId
-    ? { _id: sourceId, enabled: true }
-    : { enabled: true };
+  const query: Record<string, unknown> = { enabled: true };
+  if (opts?.sourceId) {
+    query._id = opts.sourceId;
+  } else if (!opts?.force) {
+    query.$or = [
+      { nextCrawlAt: { $lte: new Date() } },
+      { nextCrawlAt: null },
+      { nextCrawlAt: { $exists: false } },
+    ];
+  }
 
   const sources = await CrawlSource.find(query);
+  let enqueued = 0;
 
   for (const source of sources) {
-    const existingRunningJob = await CrawlJob.findOne({
+    const pending = await CrawlUrlQueue.countDocuments({
       sourceId: source._id,
-      status: "running",
+      status: { $in: ["queued", "crawling"] },
     });
+    const activeCycle = source.crawlStatus === "crawling" && pending > 0;
 
-    if (existingRunningJob) {
+    if (activeCycle && !opts?.force) continue;
+    if (activeCycle && opts?.force && pending > 0) {
+      enqueued++;
       continue;
     }
 
-    const savedProgress = await loadProgress(source._id as mongoose.Types.ObjectId);
-    const isResuming = savedProgress !== null;
+    if (!source.crawlCycleStartedAt || source.crawlStatus !== "crawling") {
+      source.crawlCycleStartedAt = new Date();
+      source.crawlStatus = "crawling";
+      source.lastActivityAt = new Date();
+      await source.save();
 
-    const job = new CrawlJob({
-      sourceId: source._id,
-      status: "running",
-      startedAt: new Date(),
+      await CrawlUrlQueue.updateMany(
+        { sourceId: source._id, status: { $in: ["completed", "failed"] } },
+        {
+          $set: {
+            status: "queued",
+            attempts: 0,
+            nextAttemptAt: new Date(),
+            errorMessage: "",
+            completedAt: null,
+          },
+        }
+      );
+    }
+
+    const { score, reason } = scoreUrl(source.baseUrl);
+    await enqueueUrl({
+      url: normalizeUrl(source.baseUrl, source.baseUrl),
+      sourceId: source._id as mongoose.Types.ObjectId,
+      depth: 0,
+      priority: score + 100,
+      reason: `source homepage (${reason})`,
     });
-    await job.save();
-
-    source.crawlStatus = "crawling";
-    await source.save();
-
-    try {
-      const config: CrawlerConfig = {
-        ...DEFAULT_CONFIG,
-        maxPages: source.maxPages || DEFAULT_CONFIG.maxPages,
-        maxDepth: source.maxDepth || DEFAULT_CONFIG.maxDepth,
-      };
-
-      const robots = await checkRobotsTxt(source.baseUrl, config);
-      config.delayBetweenRequests = Math.max(
-        config.delayBetweenRequests,
-        robots.crawlDelay * 1000
-      );
-
-      const state: CrawlState = savedProgress || {
-        visited: new Set(),
-        queue: [],
-        pagesCrawled: 0,
-        pagesSkipped: 0,
-        foundersFound: 0,
-        newFounders: 0,
-        updatedFounders: 0,
-        duplicatesFound: 0,
-        fundingPagesFound: 0,
-        hiringPagesFound: 0,
-        founderProfilesFound: 0,
-        companiesDiscovered: 0,
-        countriesDiscovered: new Set(),
-        errors: [],
-      };
-
-      if (state.queue.length === 0) {
-        const { score: homeScore, reason: homeReason } = scoreUrl(source.baseUrl);
-        state.queue.push({
-          url: source.baseUrl,
-          depth: 0,
-          priority: homeScore + 10,
-          reason: `homepage (${homeReason})`,
-        });
-      }
-
-      const siteStartTime = Date.now();
-
-      while (state.queue.length > 0 && state.pagesCrawled < config.maxPages) {
-        if (Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS) {
-          await saveProgress(source._id as mongoose.Types.ObjectId, state);
-          break;
-        }
-
-        const entry = state.queue.shift()!;
-
-        if (entry.depth > config.maxDepth) {
-          state.pagesSkipped++;
-          continue;
-        }
-
-        const normalizedUrl = normalizeUrl(entry.url, source.baseUrl);
-        if (state.visited.has(normalizedUrl)) {
-          state.pagesSkipped++;
-          continue;
-        }
-
-        state.visited.add(normalizedUrl);
-
-        if (!isAllowedByRobots(normalizedUrl, robots.disallowed)) {
-          state.pagesSkipped++;
-          continue;
-        }
-
-        const page = await fetchPage(normalizedUrl, config);
-        if (!page) {
-          state.pagesSkipped++;
-          continue;
-        }
-
-        state.pagesCrawled++;
-
-        if (state.pagesCrawled % PROGRESS_SAVE_INTERVAL === 0) {
-          await saveProgress(source._id as mongoose.Types.ObjectId, state);
-        }
-
-        await new Promise((resolve) =>
-          setTimeout(resolve, config.delayBetweenRequests)
-        );
-
-        try {
-          const $ = cheerio.load(page.html);
-          const bodyText = $("body").text() || "";
-
-          if (/funding|raises|raised|investment|backed by/i.test(bodyText)) {
-            state.fundingPagesFound++;
-          }
-          if (/hiring|we.re hiring|join our team|careers|open positions/i.test(bodyText)) {
-            state.hiringPagesFound++;
-          }
-
-          const detectedFounders = detectFoundersOnPage($, page.html, normalizedUrl);
-          const founderNames: string[] = [];
-
-          for (const detected of detectedFounders) {
-            state.foundersFound++;
-            founderNames.push(detected.name);
-
-            if (detected.country) {
-              state.countriesDiscovered.add(detected.country);
-            }
-
-            const result = await saveFounderToDb(detected);
-
-            if (result.isNew) {
-              state.newFounders++;
-            } else if (result.isDuplicate) {
-              state.duplicatesFound++;
-            }
-
-            if (detected.company) {
-              const founderId = result.founderId || (await Founder.findOne({
-                normalizedName: normalizeFounderName(detected.name),
-              }))?._id as mongoose.Types.ObjectId | undefined;
-
-              if (founderId) {
-                const companyResult = await saveCompanyToDb(
-                  detected.company,
-                  founderId,
-                  detected
-                );
-                if (companyResult.isNew) {
-                  state.companiesDiscovered++;
-                }
-
-                if (companyResult.companyId && !result.isDuplicate) {
-                  const companyBase = new URL(normalizedUrl).origin;
-
-                  for (const suffix of ["/about", "/team", "/founders", "/leadership", "/careers"]) {
-                    const candidateUrl = companyBase + suffix;
-                    if (!state.visited.has(candidateUrl)) {
-                      const { score } = scoreUrl(candidateUrl);
-                      insertByPriority(state.queue, {
-                        url: candidateUrl,
-                        depth: entry.depth + 1,
-                        priority: score + 20,
-                        reason: `company page: ${suffix}`,
-                      });
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-          if (founderNames.length > 0) {
-            state.founderProfilesFound++;
-            const profileLinks = extractFounderProfileLinks($, normalizedUrl, source.baseUrl, founderNames);
-            for (const link of profileLinks) {
-              if (!state.visited.has(link)) {
-                const { score } = scoreUrl(link);
-                insertByPriority(state.queue, {
-                  url: link,
-                  depth: entry.depth + 1,
-                  priority: score + 25,
-                  reason: "founder profile link",
-                });
-              }
-            }
-          }
-
-          const links = extractLinks($, normalizedUrl, source.baseUrl);
-          for (const link of links) {
-            if (!state.visited.has(link)) {
-              const { score, reason } = scoreUrl(link, bodyText);
-              insertByPriority(state.queue, {
-                url: link,
-                depth: entry.depth + 1,
-                priority: score,
-                reason,
-              });
-            }
-          }
-        } catch (error) {
-          state.errors.push(
-            `Error parsing ${normalizedUrl}: ${error instanceof Error ? error.message : "Unknown"}`
-          );
-        }
-      }
-
-      const queueExhausted = state.queue.length === 0;
-      const timedOut = Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS;
-
-      if (queueExhausted || state.pagesCrawled >= config.maxPages) {
-        await clearProgress(source._id as mongoose.Types.ObjectId);
-      }
-
-      job.status = "completed";
-      job.completedAt = new Date();
-      job.pagesCrawled = state.pagesCrawled;
-      job.pagesSkipped = state.pagesSkipped;
-      job.foundersFound = state.foundersFound;
-      job.newFounders = state.newFounders;
-      job.updatedFounders = state.updatedFounders;
-      job.duplicatesFound = state.duplicatesFound;
-      job.fundingPagesFound = state.fundingPagesFound;
-      job.hiringPagesFound = state.hiringPagesFound;
-      job.founderProfilesFound = state.founderProfilesFound;
-      job.companiesDiscovered = state.companiesDiscovered;
-      job.countriesDiscovered = [...state.countriesDiscovered];
-      job.crawlErrors = state.errors;
-      if (timedOut) {
-        job.crawlErrors.push(
-          `Per-site timeout (3 min) reached. Progress saved. ${state.queue.length} URLs remaining.`
-        );
-      }
-      await job.save();
-
-      source.lastCrawledAt = new Date();
-      if (!timedOut) {
-        source.nextCrawlAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-      }
-      source.crawlStatus = "idle";
-      source.pagesCrawled += state.pagesCrawled;
-      source.foundersDiscovered += state.newFounders;
-      source.crawlErrors = state.errors;
-      await source.save();
-    } catch (error) {
-      job.status = "failed";
-      job.completedAt = new Date();
-      job.errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      await job.save();
-
-      source.crawlStatus = "error";
-      source.crawlErrors.push(
-        error instanceof Error ? error.message : "Unknown error"
-      );
-      await source.save();
-    }
+    enqueued++;
   }
+
+  return { enqueued };
 }
 
-interface CrawlResult {
-  pagesCrawled: number;
-  foundersDiscovered: number;
-  companiesDiscovered: number;
-  duration: number;
-  errors: string[];
-}
+export async function finishCompletedCycles(): Promise<number> {
+  await connectDB();
+  const sources = await CrawlSource.find({ crawlStatus: "crawling" });
+  let finished = 0;
 
-interface SourceCrawlResult {
-  sourceName: string;
-  pagesCrawled: number;
-  newFounders: number;
-  companiesDiscovered: number;
-  errors: string[];
-}
+  for (const source of sources) {
+    const pending = await CrawlUrlQueue.countDocuments({
+      sourceId: source._id,
+      status: { $in: ["queued", "crawling"] },
+    });
+    if (pending > 0) continue;
 
-async function crawlOneSource(
-  source: InstanceType<typeof CrawlSource>,
-  baseConfig: CrawlerConfig
-): Promise<SourceCrawlResult> {
-  const savedProgress = await loadProgress(source._id as mongoose.Types.ObjectId);
-
-  const job = new CrawlJob({
-    sourceId: source._id,
-    status: "running",
-    startedAt: new Date(),
-  });
-  await job.save();
-
-  source.crawlStatus = "crawling";
-  await source.save();
-
-  const config = { ...baseConfig };
-
-  try {
-    const robots = await checkRobotsTxt(source.baseUrl, config);
-    config.delayBetweenRequests = Math.max(
-      config.delayBetweenRequests,
-      robots.crawlDelay * 1000
-    );
-
-    const state: CrawlState = savedProgress || {
-      visited: new Set(),
-      queue: [],
-      pagesCrawled: 0,
-      pagesSkipped: 0,
-      foundersFound: 0,
-      newFounders: 0,
-      updatedFounders: 0,
-      duplicatesFound: 0,
-      fundingPagesFound: 0,
-      hiringPagesFound: 0,
-      founderProfilesFound: 0,
-      companiesDiscovered: 0,
-      countriesDiscovered: new Set(),
-      errors: [],
-    };
-
-    if (state.queue.length === 0) {
-      const { score: homeScore, reason: homeReason } = scoreUrl(source.baseUrl);
-      state.queue.push({
-        url: source.baseUrl,
-        depth: 0,
-        priority: homeScore + 10,
-        reason: `homepage (${homeReason})`,
-      });
-    }
-
-    const siteStartTime = Date.now();
-
-    while (state.queue.length > 0 && state.pagesCrawled < config.maxPages) {
-      if (Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS) {
-        await saveProgress(source._id as mongoose.Types.ObjectId, state);
-        break;
-      }
-
-      const entry = state.queue.shift()!;
-      if (entry.depth > config.maxDepth) {
-        state.pagesSkipped++;
-        continue;
-      }
-
-      const normalizedUrl = normalizeUrl(entry.url, source.baseUrl);
-      if (state.visited.has(normalizedUrl)) {
-        state.pagesSkipped++;
-        continue;
-      }
-
-      state.visited.add(normalizedUrl);
-
-      if (!isAllowedByRobots(normalizedUrl, robots.disallowed)) {
-        state.pagesSkipped++;
-        continue;
-      }
-
-      const page = await fetchPage(normalizedUrl, config);
-      if (!page) {
-        state.pagesSkipped++;
-        continue;
-      }
-
-      state.pagesCrawled++;
-
-      if (state.pagesCrawled % PROGRESS_SAVE_INTERVAL === 0) {
-        await saveProgress(source._id as mongoose.Types.ObjectId, state);
-      }
-
-      await new Promise((resolve) =>
-        setTimeout(resolve, config.delayBetweenRequests)
-      );
-
-      try {
-        const $ = cheerio.load(page.html);
-        const bodyText = $("body").text() || "";
-
-        if (/funding|raises|raised|investment|backed by/i.test(bodyText)) {
-          state.fundingPagesFound++;
-        }
-        if (/hiring|we.re hiring|join our team|careers|open positions/i.test(bodyText)) {
-          state.hiringPagesFound++;
-        }
-
-        const detectedFounders = detectFoundersOnPage($, page.html, normalizedUrl);
-        const founderNames: string[] = [];
-
-        for (const detected of detectedFounders) {
-          state.foundersFound++;
-          founderNames.push(detected.name);
-
-          if (detected.country) {
-            state.countriesDiscovered.add(detected.country);
-          }
-
-          const result = await saveFounderToDb(detected);
-
-          if (result.isNew) {
-            state.newFounders++;
-          } else if (result.isDuplicate) {
-            state.duplicatesFound++;
-          }
-
-          if (detected.company) {
-            const founderId = result.founderId || (await Founder.findOne({
-              normalizedName: normalizeFounderName(detected.name),
-            }))?._id as mongoose.Types.ObjectId | undefined;
-
-            if (founderId) {
-              const companyResult = await saveCompanyToDb(
-                detected.company,
-                founderId,
-                detected
-              );
-              if (companyResult.isNew) {
-                state.companiesDiscovered++;
-              }
-
-              if (companyResult.companyId && !result.isDuplicate) {
-                const companyBase = new URL(normalizedUrl).origin;
-                for (const suffix of ["/about", "/team", "/founders", "/leadership", "/careers"]) {
-                  const candidateUrl = companyBase + suffix;
-                  if (!state.visited.has(candidateUrl)) {
-                    const { score } = scoreUrl(candidateUrl);
-                    insertByPriority(state.queue, {
-                      url: candidateUrl,
-                      depth: entry.depth + 1,
-                      priority: score + 20,
-                      reason: `company page: ${suffix}`,
-                    });
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        if (founderNames.length > 0) {
-          state.founderProfilesFound++;
-          const profileLinks = extractFounderProfileLinks($, normalizedUrl, source.baseUrl, founderNames);
-          for (const link of profileLinks) {
-            if (!state.visited.has(link)) {
-              const { score } = scoreUrl(link);
-              insertByPriority(state.queue, {
-                url: link,
-                depth: entry.depth + 1,
-                priority: score + 25,
-                reason: "founder profile link",
-              });
-            }
-          }
-        }
-
-        const links = extractLinks($, normalizedUrl, source.baseUrl);
-        for (const link of links) {
-          if (!state.visited.has(link)) {
-            const { score, reason } = scoreUrl(link, bodyText);
-            insertByPriority(state.queue, {
-              url: link,
-              depth: entry.depth + 1,
-              priority: score,
-              reason,
-            });
-          }
-        }
-      } catch (error) {
-        state.errors.push(
-          `Error parsing ${normalizedUrl}: ${error instanceof Error ? error.message : "Unknown"}`
-        );
-      }
-    }
-
-    const queueExhausted = state.queue.length === 0;
-    const timedOut = Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS;
-
-    if (queueExhausted || state.pagesCrawled >= config.maxPages) {
-      await clearProgress(source._id as mongoose.Types.ObjectId);
-    }
-
-    job.status = "completed";
-    job.completedAt = new Date();
-    job.pagesCrawled = state.pagesCrawled;
-    job.pagesSkipped = state.pagesSkipped;
-    job.foundersFound = state.foundersFound;
-    job.newFounders = state.newFounders;
-    job.updatedFounders = state.updatedFounders;
-    job.duplicatesFound = state.duplicatesFound;
-    job.fundingPagesFound = state.fundingPagesFound;
-    job.hiringPagesFound = state.hiringPagesFound;
-    job.founderProfilesFound = state.founderProfilesFound;
-    job.companiesDiscovered = state.companiesDiscovered;
-    job.countriesDiscovered = [...state.countriesDiscovered];
-    job.crawlErrors = state.errors;
-    if (timedOut) {
-      job.crawlErrors.push(
-        `Per-site timeout (3 min) reached. Progress saved. ${state.queue.length} URLs remaining.`
-      );
-    }
-    await job.save();
-
-    source.lastCrawledAt = new Date();
-    if (!timedOut) {
-      source.nextCrawlAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    }
+    const now = new Date();
     source.crawlStatus = "idle";
-    source.pagesCrawled += state.pagesCrawled;
-    source.foundersDiscovered += state.newFounders;
-    source.crawlErrors = state.errors;
+    source.lastCrawledAt = now;
+    source.nextCrawlAt = now;
+    source.lastActivityAt = now;
     await source.save();
 
-    return {
-      sourceName: source.name,
-      pagesCrawled: state.pagesCrawled,
-      newFounders: state.newFounders,
-      companiesDiscovered: state.companiesDiscovered,
-      errors: state.errors,
-    };
-  } catch (error) {
-    job.status = "failed";
-    job.completedAt = new Date();
-    job.errorMessage = error instanceof Error ? error.message : "Unknown error";
-    await job.save();
+    const cycleStart = source.crawlCycleStartedAt || now;
+    const pagesInCycle = await CrawlUrlQueue.countDocuments({
+      sourceId: source._id,
+      status: "completed",
+      completedAt: { $gte: cycleStart },
+    });
 
-    source.crawlStatus = "error";
-    source.crawlErrors.push(error instanceof Error ? error.message : "Unknown error");
-    await source.save();
+    await CrawlJob.create({
+      sourceId: source._id,
+      status: "completed",
+      startedAt: cycleStart,
+      completedAt: now,
+      pagesCrawled: pagesInCycle,
+      foundersFound: source.founderCandidates,
+      newFounders: source.foundersDiscovered,
+      companiesDiscovered: source.companiesDiscovered,
+      relationshipsCreated: source.relationshipsCreated,
+      relationshipsRejected: source.relationshipsRejected,
+      rejectionReasons: source.rejectionCounts,
+      crawlErrors: source.crawlErrors.slice(-20),
+    });
 
-    const errMsg = error instanceof Error ? error.message : "Unknown error";
-    return {
-      sourceName: source.name,
-      pagesCrawled: 0,
-      newFounders: 0,
-      companiesDiscovered: 0,
-      errors: [errMsg],
-    };
+    finished++;
   }
+
+  return finished;
 }
 
-async function runWithConcurrency<T>(
-  tasks: (() => Promise<T>)[],
-  concurrency: number
-): Promise<T[]> {
-  const results: T[] = new Array(tasks.length);
-  let index = 0;
+export async function getQueueStats(): Promise<{
+  queued: number;
+  crawling: number;
+  completed: number;
+  failed: number;
+}> {
+  await connectDB();
+  const [queued, crawling, completed, failed] = await Promise.all([
+    CrawlUrlQueue.countDocuments({ status: "queued" }),
+    CrawlUrlQueue.countDocuments({ status: "crawling" }),
+    CrawlUrlQueue.countDocuments({ status: "completed" }),
+    CrawlUrlQueue.countDocuments({ status: "failed" }),
+  ]);
+  return { queued, crawling, completed, failed };
+}
 
-  async function worker() {
-    while (index < tasks.length) {
-      const i = index++;
-      results[i] = await tasks[i]();
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker());
-  await Promise.all(workers);
-  return results;
+export async function runCrawler(sourceId?: string): Promise<{ enqueued: number }> {
+  return kickSources({ sourceId, force: true });
 }
 
 export async function runFullCrawl(opts?: {
   maxPages?: number;
   maxDepth?: number;
-  maxConcurrent?: number;
-  delayMs?: number;
-  timeoutMs?: number;
-}): Promise<CrawlResult> {
-  const startTime = Date.now();
-  const concurrency = opts?.maxConcurrent ?? 3;
-  const config: CrawlerConfig = {
-    ...DEFAULT_CONFIG,
-    maxPages: opts?.maxPages ?? DEFAULT_CONFIG.maxPages,
-    maxDepth: opts?.maxDepth ?? DEFAULT_CONFIG.maxDepth,
-    delayBetweenRequests: opts?.delayMs ?? DEFAULT_CONFIG.delayBetweenRequests,
-    requestTimeout: opts?.timeoutMs ?? DEFAULT_CONFIG.requestTimeout,
-  };
-
+}): Promise<{ enqueued: number; queue: Awaited<ReturnType<typeof getQueueStats>> }> {
   await connectDB();
 
-  const sources = await CrawlSource.find({ enabled: true });
-
-  const skipSources: string[] = [];
-  const resumeSources: string[] = [];
-
-  for (const s of sources) {
-    const runningJob = await CrawlJob.findOne({ sourceId: s._id, status: "running" });
-    if (runningJob) {
-      skipSources.push(s.name);
-      continue;
-    }
-    const hasProgress = await CrawlProgress.findOne({ sourceId: s._id });
-    if (hasProgress) {
-      resumeSources.push(s.name);
-    }
+  if (opts?.maxPages || opts?.maxDepth) {
+    const update: Record<string, number> = {};
+    if (opts.maxPages) update.maxPages = opts.maxPages;
+    if (opts.maxDepth) update.maxDepth = opts.maxDepth;
+    await CrawlSource.updateMany({ enabled: true }, update);
   }
 
-  const availableSources = sources.filter((s) => !skipSources.includes(s.name));
-
-  const tasks = availableSources.map((source) => () => crawlOneSource(source, config));
-  const results = await runWithConcurrency(tasks, concurrency);
-
-  const allErrors: string[] = [];
-  let totalPages = 0;
-  let totalFounders = 0;
-  let totalCompanies = 0;
-
-  for (const r of results) {
-    totalPages += r.pagesCrawled;
-    totalFounders += r.newFounders;
-    totalCompanies += r.companiesDiscovered;
-    allErrors.push(...r.errors);
-  }
-
-  return {
-    pagesCrawled: totalPages,
-    foundersDiscovered: totalFounders,
-    companiesDiscovered: totalCompanies,
-    duration: Date.now() - startTime,
-    errors: allErrors,
-  };
+  const { enqueued } = await kickSources({ force: true });
+  const queue = await getQueueStats();
+  return { enqueued, queue };
 }

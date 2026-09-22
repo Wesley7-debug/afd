@@ -15,6 +15,9 @@ export interface ICrawlJob extends Document {
   hiringPagesFound: number;
   founderProfilesFound: number;
   companiesDiscovered: number;
+  relationshipsCreated: number;
+  relationshipsRejected: number;
+  rejectionReasons: { reason: string; count: number }[];
   countriesDiscovered: string[];
   crawlErrors: string[];
   errorMessage: string;
@@ -42,6 +45,15 @@ const CrawlJobSchema = new Schema<ICrawlJob>(
     hiringPagesFound: { type: Number, default: 0 },
     founderProfilesFound: { type: Number, default: 0 },
     companiesDiscovered: { type: Number, default: 0 },
+    relationshipsCreated: { type: Number, default: 0 },
+    relationshipsRejected: { type: Number, default: 0 },
+    rejectionReasons: [
+      {
+        _id: false,
+        reason: { type: String },
+        count: { type: Number, default: 0 },
+      },
+    ],
     countriesDiscovered: [{ type: String }],
     crawlErrors: [{ type: String }],
     errorMessage: { type: String, default: "" },

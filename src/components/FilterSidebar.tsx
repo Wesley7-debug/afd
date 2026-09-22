@@ -20,8 +20,10 @@ interface FilterState {
   roles: string[];
   countries: string[];
   foundedYears: number[];
+  foundedYearRange: string;
   hasX: boolean;
   isHiring: boolean;
+  notHiring: boolean;
   hasBio: boolean;
 }
 
@@ -34,6 +36,12 @@ interface FilterSidebarProps {
 }
 
 const YEAR_OPTIONS = [2020, 2021, 2022, 2023, 2024, 2025, 2026];
+const YEAR_RANGES = [
+  { label: "2020–2026", value: "2020-2026" },
+  { label: "2024–2026", value: "2024-2026" },
+  { label: "2022–2026", value: "2022-2026" },
+  { label: "2020–2023", value: "2020-2023" },
+];
 
 export default function FilterSidebar({ filters, onFiltersChange, totalResults, onClose, isOpen }: FilterSidebarProps) {
   const [facets, setFacets] = useState<Facets>({ industries: [], locations: [], roles: [], countries: [] });
@@ -75,8 +83,23 @@ export default function FilterSidebar({ filters, onFiltersChange, totalResults, 
   );
 
   const toggleBooleanFilter = useCallback(
-    (key: "hasX" | "isHiring" | "hasBio") => {
-      onFiltersChange({ ...filters, [key]: !filters[key] });
+    (key: "hasX" | "isHiring" | "notHiring" | "hasBio") => {
+      const next = !filters[key];
+      const update: FilterState = { ...filters, [key]: next };
+      if (key === "isHiring" && next) update.notHiring = false;
+      if (key === "notHiring" && next) update.isHiring = false;
+      onFiltersChange(update);
+    },
+    [filters, onFiltersChange]
+  );
+
+  const setYearRange = useCallback(
+    (value: string) => {
+      onFiltersChange({
+        ...filters,
+        foundedYearRange: filters.foundedYearRange === value ? "" : value,
+        foundedYears: [],
+      });
     },
     [filters, onFiltersChange]
   );
@@ -88,8 +111,10 @@ export default function FilterSidebar({ filters, onFiltersChange, totalResults, 
       roles: [],
       countries: [],
       foundedYears: [],
+      foundedYearRange: "",
       hasX: false,
       isHiring: false,
+      notHiring: false,
       hasBio: false,
     });
   }, [onFiltersChange]);
@@ -100,8 +125,10 @@ export default function FilterSidebar({ filters, onFiltersChange, totalResults, 
     filters.roles.length +
     filters.countries.length +
     filters.foundedYears.length +
+    (filters.foundedYearRange ? 1 : 0) +
     (filters.hasX ? 1 : 0) +
     (filters.isHiring ? 1 : 0) +
+    (filters.notHiring ? 1 : 0) +
     (filters.hasBio ? 1 : 0);
 
   const filteredIndustries = facets.industries.filter((i) =>
@@ -236,6 +263,16 @@ export default function FilterSidebar({ filters, onFiltersChange, totalResults, 
             isOpen={openSections.year}
             onToggle={() => toggleSection("year")}
           >
+            {YEAR_RANGES.map((r) => (
+              <FilterOptionRow
+                key={r.value}
+                label={r.label}
+                count={0}
+                checked={filters.foundedYearRange === r.value}
+                onChange={() => setYearRange(r.value)}
+              />
+            ))}
+            <div className="my-1 border-t border-yc-line-subtle" />
             {YEAR_OPTIONS.map((year) => (
               <FilterOptionRow
                 key={year}
@@ -268,7 +305,7 @@ export default function FilterSidebar({ filters, onFiltersChange, totalResults, 
             )}
           </FilterSection>
 
-          <FilterSection label="More" count={3} isOpen={openSections.more} onToggle={() => toggleSection("more")}>
+          <FilterSection label="More" count={4} isOpen={openSections.more} onToggle={() => toggleSection("more")}>
             <FilterOptionRow
               label="Has bio"
               count={0}
@@ -282,10 +319,16 @@ export default function FilterSidebar({ filters, onFiltersChange, totalResults, 
               onChange={() => toggleBooleanFilter("hasX")}
             />
             <FilterOptionRow
-              label="Hiring"
+              label="Hiring now"
               count={0}
               checked={filters.isHiring}
               onChange={() => toggleBooleanFilter("isHiring")}
+            />
+            <FilterOptionRow
+              label="Not hiring"
+              count={0}
+              checked={filters.notHiring}
+              onChange={() => toggleBooleanFilter("notHiring")}
             />
           </FilterSection>
         </div>

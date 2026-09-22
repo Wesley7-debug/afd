@@ -1,11 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { runFullCrawl } from "@/crawler/engine";
+import { ensureCrawlerRunning, getCrawlerStatusAsync } from "@/crawler/scheduler";
 import { connectDB } from "@/lib/mongodb";
-import Founder from "@/models/Founder";
-import Company from "@/models/Company";
-import CrawlJob from "@/models/CrawlJob";
-import CrawlSource from "@/models/CrawlSource";
-import CrawlProgress from "@/models/CrawlProgress";
+import { Founder, Company, CrawlSource, CrawlJob, CrawlUrlQueue } from "@/models";
 
 const ADMIN_SECRET = "af-admin-2024-xK9mP2vQ8nR5";
 
@@ -17,36 +14,30 @@ export async function POST(req: NextRequest) {
 
   try {
     await connectDB();
-
     const body = await req.json().catch(() => ({}));
-    const { maxPages = 500, maxDepth = 8, maxConcurrent = 3 } = body;
+    const { maxPages, maxDepth } = body;
 
-    const result = await runFullCrawl({
-      maxPages,
-      maxDepth,
-      maxConcurrent,
-      delayMs: 1500,
-      timeoutMs: 30000,
-    });
+    const result = await runFullCrawl({ maxPages, maxDepth });
+    ensureCrawlerRunning().catch(() => {});
+    const crawler = await getCrawlerStatusAsync();
 
     const founderCount = await Founder.countDocuments();
     const companyCount = await Company.countDocuments();
-    const remainingProgress = await CrawlProgress.countDocuments();
 
     return NextResponse.json({
       ok: true,
+      message: `Crawler running — ${result.enqueued} source(s) enqueued. Workers process the queue continuously.`,
       crawl: {
-        pagesCrawled: result.pagesCrawled,
-        foundersDiscovered: result.foundersDiscovered,
-        companiesDiscovered: result.companiesDiscovered,
-        duration: result.duration,
-        errors: result.errors.length,
+        pagesCrawled: result.queue.completed,
+        foundersDiscovered: founderCount,
+        companiesDiscovered: companyCount,
+        queued: result.queue.queued,
+        crawling: result.queue.crawling,
+        duration: 0,
+        errors: result.queue.failed,
       },
-      totals: {
-        founders: founderCount,
-        companies: companyCount,
-      },
-      resumableSources: remainingProgress,
+      totals: { founders: founderCount, companies: companyCount },
+      crawler,
     });
   } catch (error) {
     return NextResponse.json({ ok: false, error: String(error) }, { status: 500 });
@@ -65,22 +56,45 @@ export async function GET(req: NextRequest) {
     const founderCount = await Founder.countDocuments();
     const companyCount = await Company.countDocuments();
     const jobCount = await CrawlJob.countDocuments();
-    const lastJob = await CrawlJob.findOne().sort({ createdAt: -1 });
+    const lastJob = await CrawlJob.findOne().sort({ createdAt: -1 }).lean();
 
     const totalSources = await CrawlSource.countDocuments({ enabled: true });
-    const runningJobs = await CrawlJob.countDocuments({ status: "running" });
-    const resumableSources = await CrawlProgress.countDocuments();
+    const crawler = await getCrawlerStatusAsync();
 
-    const progressDocs = await CrawlProgress.find().populate("sourceId", "name baseUrl");
-    const resumableList = progressDocs.map((p: any) => ({
-      name: p.sourceId?.name || "Unknown",
-      baseUrl: p.sourceId?.baseUrl || "",
-      pagesCrawled: p.pagesCrawled,
-      queueSize: p.queue.length,
-      foundersFound: p.newFounders,
-      companiesFound: p.companiesDiscovered,
-      lastSavedAt: p.lastSavedAt,
-    }));
+    const [queueByStatus, sources] = await Promise.all([
+      CrawlUrlQueue.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+      CrawlSource.find({ enabled: true }).sort({ lastActivityAt: -1, name: 1 }).lean(),
+    ]);
+
+    const queueMap = Object.fromEntries(queueByStatus.map((q: { _id: string; count: number }) => [q._id, q.count]));
+
+    const sourceStats = await Promise.all(
+      sources.map(async (s: any) => {
+        const [discovered, remaining] = await Promise.all([
+          CrawlUrlQueue.countDocuments({ sourceId: s._id }),
+          CrawlUrlQueue.countDocuments({ sourceId: s._id, status: { $in: ["queued", "crawling"] } }),
+        ]);
+        return {
+          name: s.name,
+          baseUrl: s.baseUrl,
+          crawlStatus: s.crawlStatus,
+          pagesDiscovered: discovered,
+          pagesCrawled: s.pagesCrawled || 0,
+          pagesRemaining: remaining,
+          founderCandidates: s.founderCandidates || 0,
+          foundersDiscovered: s.foundersDiscovered || 0,
+          companiesDiscovered: s.companiesDiscovered || 0,
+          relationshipsCreated: s.relationshipsCreated || 0,
+          relationshipsRejected: s.relationshipsRejected || 0,
+          rejectionCounts: s.rejectionCounts || [],
+          errors: s.errorCount || 0,
+          lastActivityAt: s.lastActivityAt || s.lastCrawledAt || null,
+          nextCrawlAt: s.nextCrawlAt || null,
+        };
+      })
+    );
+
+    const pendingSources = sourceStats.filter((s) => s.pagesRemaining > 0 || s.crawlStatus === "crawling");
 
     return NextResponse.json({
       ok: true,
@@ -89,9 +103,27 @@ export async function GET(req: NextRequest) {
         companies: companyCount,
         crawlJobs: jobCount,
         totalSources,
-        runningJobs,
-        resumableSources,
-        resumableList,
+        runningJobs: queueMap.crawling || 0,
+        queuedUrls: queueMap.queued || 0,
+        completedUrls: queueMap.completed || 0,
+        failedUrls: queueMap.failed || 0,
+        resumableSources: pendingSources.length,
+        resumableList: pendingSources.slice(0, 20).map((s) => ({
+          name: s.name,
+          baseUrl: s.baseUrl,
+          pagesCrawled: s.pagesCrawled,
+          queueSize: s.pagesRemaining,
+          foundersFound: s.foundersDiscovered,
+          companiesFound: s.companiesDiscovered,
+          lastSavedAt: s.lastActivityAt,
+        })),
+        crawler: {
+          running: crawler.running,
+          workers: crawler.workers,
+          startedAt: crawler.startedAt,
+          ticks: crawler.ticks,
+        },
+        sourceStats,
         lastCrawl: lastJob
           ? {
               pagesCrawled: lastJob.pagesCrawled,

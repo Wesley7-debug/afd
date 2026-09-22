@@ -14,7 +14,8 @@ export interface ICompany extends Document {
   country: string;
   foundedYear: number;
   teamSize: number;
-  isHiring: boolean;
+  isHiring: boolean | null;
+  hiringEvidence: string;
   batch: string;
   tags: string[];
   workMode: string;
@@ -40,7 +41,8 @@ const CompanySchema = new Schema<ICompany>(
     country: { type: String, default: "Nigeria", index: true },
     foundedYear: { type: Number, default: 0 },
     teamSize: { type: Number, default: 0 },
-    isHiring: { type: Boolean, default: false },
+    isHiring: { type: Boolean, default: null },
+    hiringEvidence: { type: String, default: "" },
     batch: { type: String, default: "" },
     tags: [{ type: String }],
     workMode: { type: String, default: "" },
