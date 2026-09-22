@@ -17,15 +17,11 @@ export async function startScheduler() {
 
   scheduledTask = cron.schedule(cronExpression, async () => {
     try {
-      console.log(`[Scheduler] Starting scheduled crawl at ${new Date().toISOString()}`);
       await runCrawler();
-      console.log(`[Scheduler] Crawl completed at ${new Date().toISOString()}`);
-    } catch (error) {
-      console.error(`[Scheduler] Crawl failed:`, error);
+    } catch {
+      // crawl failed silently
     }
   });
-
-  console.log(`[Scheduler] Started with cron expression: ${cronExpression}`);
 }
 
 export function stopScheduler() {
@@ -34,7 +30,6 @@ export function stopScheduler() {
     scheduledTask = null;
   }
   schedulerRunning = false;
-  console.log("[Scheduler] Stopped");
 }
 
 export function getSchedulerStatus() {

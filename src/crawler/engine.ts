@@ -147,21 +147,21 @@ async function saveProgress(
         founderProfilesFound: state.founderProfilesFound,
         companiesDiscovered: state.companiesDiscovered,
         countriesDiscovered: [...state.countriesDiscovered],
-        errors: state.errors,
+        crawlErrors: state.errors,
         lastSavedAt: new Date(),
       },
       { upsert: true }
     );
-  } catch (err) {
-    console.error(`[CrawlProgress] Failed to save progress for ${sourceId}:`, err);
+  } catch {
+    // save failed, continue silently
   }
 }
 
 async function clearProgress(sourceId: mongoose.Types.ObjectId): Promise<void> {
   try {
     await CrawlProgress.deleteOne({ sourceId });
-  } catch (err) {
-    console.error(`[CrawlProgress] Failed to clear progress for ${sourceId}:`, err);
+  } catch {
+    // clear failed, continue silently
   }
 }
 
@@ -171,10 +171,6 @@ async function loadProgress(
   try {
     const saved = await CrawlProgress.findOne({ sourceId });
     if (!saved) return null;
-
-    console.log(
-      `[CrawlProgress] Resuming source ${sourceId}: ${saved.pagesCrawled} pages crawled, ${saved.queue.length} URLs queued`
-    );
 
     return {
       visited: new Set(saved.visitedUrls),
@@ -195,10 +191,9 @@ async function loadProgress(
       founderProfilesFound: saved.founderProfilesFound,
       companiesDiscovered: saved.companiesDiscovered,
       countriesDiscovered: new Set(saved.countriesDiscovered),
-      errors: saved.errors,
+      errors: saved.crawlErrors,
     };
-  } catch (err) {
-    console.error(`[CrawlProgress] Failed to load progress for ${sourceId}:`, err);
+  } catch {
     return null;
   }
 }
@@ -635,9 +630,6 @@ export async function runCrawler(sourceId?: string): Promise<void> {
 
       while (state.queue.length > 0 && state.pagesCrawled < config.maxPages) {
         if (Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS) {
-          console.log(
-            `[Crawl] Per-site timeout (3 min) reached for ${source.name} after ${state.pagesCrawled} pages. Saving state...`
-          );
           await saveProgress(source._id as mongoose.Types.ObjectId, state);
           break;
         }
@@ -903,9 +895,6 @@ async function crawlOneSource(
 
     while (state.queue.length > 0 && state.pagesCrawled < config.maxPages) {
       if (Date.now() - siteStartTime > PER_SITE_TIMEOUT_MS) {
-        console.log(
-          `[Crawl] Per-site timeout (3 min) reached for ${source.name} after ${state.pagesCrawled} pages. Saving state...`
-        );
         await saveProgress(source._id as mongoose.Types.ObjectId, state);
         break;
       }
@@ -1167,10 +1156,6 @@ export async function runFullCrawl(opts?: {
 
   const availableSources = sources.filter((s) => !skipSources.includes(s.name));
 
-  console.log(
-    `[Crawl] ${availableSources.length} sources to crawl, ${resumeSources.length} will resume, ${skipSources.length} skipped (already running), concurrency: ${concurrency}`
-  );
-
   const tasks = availableSources.map((source) => () => crawlOneSource(source, config));
   const results = await runWithConcurrency(tasks, concurrency);
 
@@ -1184,9 +1169,6 @@ export async function runFullCrawl(opts?: {
     totalFounders += r.newFounders;
     totalCompanies += r.companiesDiscovered;
     allErrors.push(...r.errors);
-    console.log(
-      `  [${r.sourceName}] ${r.pagesCrawled} pages, ${r.newFounders} founders, ${r.companiesDiscovered} companies, ${r.errors.length} errors`
-    );
   }
 
   return {

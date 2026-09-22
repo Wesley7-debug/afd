@@ -520,8 +520,6 @@ function normalizeName(name: string): string {
 export async function seedFounders() {
   await connectDB();
 
-  console.log("=== SEEDING FOUNDERS & COMPANIES ===\n");
-
   let foundersCreated = 0;
   let companiesCreated = 0;
   let skipped = 0;
@@ -606,9 +604,4 @@ export async function seedFounders() {
       foundersCreated++;
     }
   }
-
-  console.log(`Companies created: ${companiesCreated}`);
-  console.log(`Founders created: ${foundersCreated}`);
-  console.log(`Skipped (duplicates): ${skipped}`);
-  console.log(`\n=== SEED COMPLETE ===`);
 }

@@ -754,8 +754,4 @@ export async function seedInitialSources() {
       created++;
     }
   }
-
-  console.log(
-    `[Seed] ${created} new sources created (${INITIAL_SOURCES.length} total)`,
-  );
 }

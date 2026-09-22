@@ -20,7 +20,7 @@ export interface ICrawlProgress extends Document {
   founderProfilesFound: number;
   companiesDiscovered: number;
   countriesDiscovered: string[];
-  errors: string[];
+  crawlErrors: string[];
   lastSavedAt: Date;
   createdAt: Date;
   updatedAt: Date;
@@ -57,13 +57,11 @@ const CrawlProgressSchema = new Schema<ICrawlProgress>(
     founderProfilesFound: { type: Number, default: 0 },
     companiesDiscovered: { type: Number, default: 0 },
     countriesDiscovered: [{ type: String }],
-    errors: [{ type: String }],
+    crawlErrors: [{ type: String }],
     lastSavedAt: { type: Date, default: Date.now },
   },
   { timestamps: true }
 );
-
-CrawlProgressSchema.index({ sourceId: 1 });
 
 const CrawlProgress: Model<ICrawlProgress> =
   mongoose.models.CrawlProgress ||

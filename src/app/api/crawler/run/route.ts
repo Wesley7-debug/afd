@@ -8,9 +8,7 @@ export async function POST(request: NextRequest) {
     const body = await request.json().catch(() => ({}));
     const sourceId = body.sourceId;
 
-    runCrawler(sourceId).catch((err) => {
-      console.error("[API] Crawl error:", err);
-    });
+    runCrawler(sourceId).catch(() => {});
 
     return NextResponse.json({
       message: "Crawl started",

@@ -1,13 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const ADMIN_EMAIL = "eugenefidelis573@gmail.com";
-const ADMIN_SECRET = "Investor@1";
+const ADMIN_SECRET = "af-admin-2024-xK9mP2vQ8nR5";
 
 export async function POST(req: NextRequest) {
   try {
     const { email, secret } = await req.json();
 
-    if (email === ADMIN_EMAIL && secret === ADMIN_SECRET) {
+    if (secret === ADMIN_SECRET && email) {
       const response = NextResponse.json({ ok: true, email });
       response.cookies.set("admin_token", ADMIN_SECRET, {
         httpOnly: true,

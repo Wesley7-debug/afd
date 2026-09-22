@@ -4,6 +4,8 @@ import { connectDB } from "@/lib/mongodb";
 import Founder from "@/models/Founder";
 import Company from "@/models/Company";
 import CrawlJob from "@/models/CrawlJob";
+import CrawlSource from "@/models/CrawlSource";
+import CrawlProgress from "@/models/CrawlProgress";
 
 const ADMIN_SECRET = "af-admin-2024-xK9mP2vQ8nR5";
 
@@ -19,8 +21,6 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => ({}));
     const { maxPages = 500, maxDepth = 8, maxConcurrent = 3 } = body;
 
-    console.log(`[Admin] Starting crawl: maxPages=${maxPages}, maxDepth=${maxDepth}`);
-
     const result = await runFullCrawl({
       maxPages,
       maxDepth,
@@ -31,6 +31,7 @@ export async function POST(req: NextRequest) {
 
     const founderCount = await Founder.countDocuments();
     const companyCount = await Company.countDocuments();
+    const remainingProgress = await CrawlProgress.countDocuments();
 
     return NextResponse.json({
       ok: true,
@@ -45,9 +46,9 @@ export async function POST(req: NextRequest) {
         founders: founderCount,
         companies: companyCount,
       },
+      resumableSources: remainingProgress,
     });
   } catch (error) {
-    console.error("[Admin] Crawl failed:", error);
     return NextResponse.json({ ok: false, error: String(error) }, { status: 500 });
   }
 }
@@ -66,18 +67,38 @@ export async function GET(req: NextRequest) {
     const jobCount = await CrawlJob.countDocuments();
     const lastJob = await CrawlJob.findOne().sort({ createdAt: -1 });
 
+    const totalSources = await CrawlSource.countDocuments({ enabled: true });
+    const runningJobs = await CrawlJob.countDocuments({ status: "running" });
+    const resumableSources = await CrawlProgress.countDocuments();
+
+    const progressDocs = await CrawlProgress.find().populate("sourceId", "name baseUrl");
+    const resumableList = progressDocs.map((p: any) => ({
+      name: p.sourceId?.name || "Unknown",
+      baseUrl: p.sourceId?.baseUrl || "",
+      pagesCrawled: p.pagesCrawled,
+      queueSize: p.queue.length,
+      foundersFound: p.newFounders,
+      companiesFound: p.companiesDiscovered,
+      lastSavedAt: p.lastSavedAt,
+    }));
+
     return NextResponse.json({
       ok: true,
       stats: {
         founders: founderCount,
         companies: companyCount,
         crawlJobs: jobCount,
+        totalSources,
+        runningJobs,
+        resumableSources,
+        resumableList,
         lastCrawl: lastJob
           ? {
               pagesCrawled: lastJob.pagesCrawled,
               foundersDiscovered: lastJob.newFounders,
               companiesDiscovered: lastJob.companiesDiscovered,
               createdAt: lastJob.createdAt,
+              status: lastJob.status,
             }
           : null,
       },
