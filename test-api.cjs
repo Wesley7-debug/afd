@@ -154,62 +154,7 @@ async function test() {
     assert('Founder _id matches', fOid.body._id === oid);
   }
 
-  // 12. Companies list
-  console.log('\n--- /api/companies (basic) ---');
-  const c1 = await get('/api/companies?limit=5');
-  assert('GET /api/companies returns 200', c1.status === 200);
-  assert('Has companies array', Array.isArray(c1.body.companies));
-  assert('Has pagination', c1.body.pagination && typeof c1.body.pagination.total === 'number');
-  assert('Returns max 5', c1.body.companies.length <= 5);
-  console.log(`  Companies returned: ${c1.body.companies.length}, total: ${c1.body.pagination.total}\n`);
-
-  // 13. Company search
-  console.log('--- /api/companies?search=... ---');
-  const cName = c1.body.companies[0]?.name || '';
-  const cSearchPart = cName.split(' ')[0];
-  const cSearch = await get(`/api/companies?search=${encodeURIComponent(cSearchPart)}`);
-  assert('Company search returns 200', cSearch.status === 200);
-  assert('Company search finds results', cSearch.body.companies.length > 0);
-  console.log(`  Searched "${cSearchPart}", found ${cSearch.body.companies.length} results\n`);
-
-  // 14. Company industry filter
-  console.log('--- /api/companies?industry=... ---');
-  const cIndustries = [...new Set(c1.body.companies.map(c => c.industry).filter(Boolean))];
-  if (cIndustries.length > 0) {
-    const cInd = await get(`/api/companies?industry=${encodeURIComponent(cIndustries[0])}`);
-    assert(`Company industry filter returns 200`, cInd.status === 200);
-    assert('Company industry filter has results', cInd.body.companies.length > 0);
-  } else {
-    console.log('  No industries in company data, skipping');
-  }
-
-  // 15. Company sort
-  console.log('\n--- /api/companies?sort=... ---');
-  const cSortName = await get('/api/companies?sort=name&limit=5');
-  assert('Company sort by name returns 200', cSortName.status === 200);
-  const cSortNewest = await get('/api/companies?sort=newest&limit=5');
-  assert('Company sort by newest returns 200', cSortNewest.status === 200);
-
-  // 16. Single company by slug
-  console.log('\n--- /api/companies/:id (by slug) ---');
-  const cSlug = c1.body.companies[0]?.slug;
-  if (cSlug) {
-    const cSingle = await get(`/api/companies/${cSlug}`);
-    assert('Company get by slug returns 200', cSingle.status === 200);
-    assert('Company has name', !!cSingle.body.name);
-    assert('Company slug matches', cSingle.body.slug === cSlug);
-    console.log(`  Got company: ${cSingle.body.name}`);
-  }
-
-  // 17. Single company by ObjectId
-  console.log('\n--- /api/companies/:id (by ObjectId) ---');
-  const cOid = c1.body.companies[0]?._id;
-  if (cOid) {
-    const cOidRes = await get(`/api/companies/${cOid}`);
-    assert('Company get by ObjectId returns 200', cOidRes.status === 200);
-  }
-
-  // 18. Sources
+  // 12. Sources
   console.log('\n--- /api/sources ---');
   const src = await get('/api/sources');
   assert('GET /api/sources returns 200', src.status === 200);
@@ -217,33 +162,32 @@ async function test() {
   assert('Sources count = 7', src.body.length === 7);
   console.log(`  Sources: ${src.body.length}`);
 
-  // 19. Crawler jobs
+  // 13. Crawler jobs
   console.log('\n--- /api/crawler/jobs ---');
   const jobs = await get('/api/crawler/jobs');
   assert('GET /api/crawler/jobs returns 200', jobs.status === 200);
   assert('Has jobs array', Array.isArray(jobs.body.jobs));
   console.log(`  Jobs: ${jobs.body.jobs.length}`);
 
-  // 20. Search endpoint
+  // 14. Search endpoint
   console.log('\n--- /api/search ---');
   const s = await get('/api/search?q=nigeria');
   assert('GET /api/search returns 200', s.status === 200);
   assert('Search has founders', Array.isArray(s.body.founders));
-  assert('Search has companies', Array.isArray(s.body.companies));
-  console.log(`  Search "nigeria": ${s.body.founders.length} founders, ${s.body.companies.length} companies`);
+  console.log(`  Search "nigeria": ${s.body.founders.length} founders`);
 
-  // 21. Combined filters
+  // 15. Combined filters
   console.log('\n--- Combined filters ---');
   const combined = await get('/api/founders?search=&industry=&location=&hasX=true&sort=newest&page=1&limit=10');
   assert('Combined filters returns 200', combined.status === 200);
   assert('Combined has results type', Array.isArray(combined.body.founders));
 
-  // 22. Pages rendering
+  // 16. Pages rendering
   console.log('\n--- Frontend pages ---');
   const home = await get('/');
   assert('Home page returns 200', home.status === 200);
   const comp = await get('/companies');
-  assert('Companies page returns 200', comp.status === 200);
+  assert('Companies page removed (404)', comp.status === 404);
   const fProf = await get(`/founders/${f1.body.founders[0]?.slug || 'test'}`);
   assert('Founder profile returns 200 or 404', fProf.status === 200 || fProf.status === 404);
 
