@@ -1,0 +1,17 @@
+▲ Next.js 16.3.5 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://172.22.48.1:3000
+- Environments: .env.local
+✓ Ready in 1105ms
+✓ Running next.config.ts took 82ms
+
+ GET /?view=people 200 in 811ms (next.js: 423ms, application-code: 388ms)
+ GET / 200 in 95ms (next.js: 22ms, application-code: 74ms)
+ GET / 200 in 143ms (next.js: 30ms, application-code: 113ms)
+ GET /companies 200 in 138ms (next.js: 60ms, application-code: 78ms)
+ GET /api/companies?page=1&limit=20&sort=newest&industry=SaaS 500 in 1483ms (next.js: 301ms, application-code: 1182ms)
+ GET /api/stats 500 in 68ms (next.js: 59ms, application-code: 9ms)
+  Reload env: .env.local
+ GET /companies 200 in 274ms (next.js: 206ms, application-code: 68ms)
+  Reload env: .env.local
+ GET /companies 200 in 211ms (next.js: 155ms, application-code: 56ms)
