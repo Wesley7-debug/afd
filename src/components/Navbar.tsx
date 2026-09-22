@@ -53,16 +53,6 @@ export default function Navbar() {
             >
               Directory
             </Link>
-            <Link
-              href="/companies"
-              className={`transition-colors ${
-                pathname === "/companies"
-                  ? "font-medium text-yc-ink"
-                  : "text-yc-ink-muted hover:text-yc-ink"
-              }`}
-            >
-              Companies
-            </Link>
           </nav>
         </div>
 

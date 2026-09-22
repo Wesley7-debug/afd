@@ -22,7 +22,10 @@ async function main() {
   console.log("deleting garbage companies:", garbage.map((g) => g.name));
   if (ids.length > 0) {
     const res = await companies.deleteMany({ _id: { $in: ids } });
-    const pull = await founders.updateMany({}, { $pull: { companies: { $in: ids } } });
+    const pull = await founders.updateMany(
+      {},
+      { $pull: { companies: { $in: ids } } } as unknown as Record<string, unknown>
+    );
     console.log("deleted:", res.deletedCount, "| founder refs pulled:", pull.modifiedCount);
   } else {
     console.log("nothing to delete");

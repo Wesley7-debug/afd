@@ -5,31 +5,19 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
 
   try {
     const { connectDB } = await import("@/lib/mongodb");
-    const { Founder, Company } = await import("@/models");
+    const { Founder } = await import("@/models");
 
     await connectDB();
 
-    const [founders, companies] = await Promise.all([
-      Founder.find({ slug: { $exists: true, $ne: "" } })
-        .select("slug updatedAt")
-        .lean(),
-      Company.find({ slug: { $exists: true, $ne: "" } })
-        .select("slug updatedAt")
-        .lean(),
-    ]);
+    const founders = await Founder.find({ slug: { $exists: true, $ne: "" } })
+      .select("slug updatedAt")
+      .lean();
 
     const founderUrls = founders.map((f) => ({
       url: `${baseUrl}/founders/${f.slug}`,
       lastModified: f.updatedAt,
       changeFrequency: "weekly" as const,
       priority: 0.8,
-    }));
-
-    const companyUrls = companies.map((c) => ({
-      url: `${baseUrl}/companies/${c.slug}`,
-      lastModified: c.updatedAt,
-      changeFrequency: "weekly" as const,
-      priority: 0.7,
     }));
 
     return [
@@ -40,7 +28,6 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
         priority: 1,
       },
       ...founderUrls,
-      ...companyUrls,
     ];
   } catch {
     return [

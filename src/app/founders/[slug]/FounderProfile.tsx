@@ -124,10 +124,9 @@ export default function FounderProfile({ founder }: { founder: FounderProfileDat
             <h2 className="text-xs font-medium uppercase tracking-[0.72px] text-yc-ink-3">Companies</h2>
             <div className="mt-3 space-y-3">
               {founder.companies.map((company) => (
-                <Link
+                <div
                   key={company._id}
-                  href={`/companies/${company.slug}`}
-                  className="flex items-center gap-3 rounded-lg border border-yc-line-subtle p-4 transition-colors hover:bg-yc-hover"
+                  className="flex items-center gap-3 rounded-lg border border-yc-line-subtle p-4"
                 >
                   {company.logoUrl ? (
                     <img
@@ -147,7 +146,7 @@ export default function FounderProfile({ founder }: { founder: FounderProfileDat
                       {company.location && <span>&middot; {company.location}</span>}
                     </div>
                   </div>
-                </Link>
+                </div>
               ))}
             </div>
           </div>
