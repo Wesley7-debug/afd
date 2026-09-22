@@ -53,23 +53,56 @@ export async function GET(req: NextRequest) {
   try {
     await connectDB();
 
-    const founderCount = await Founder.countDocuments();
-    const companyCount = await Company.countDocuments();
     const jobCount = await CrawlJob.countDocuments();
     const lastJob = await CrawlJob.findOne().sort({ createdAt: -1 }).lean();
 
     const totalSources = await CrawlSource.countDocuments({ enabled: true });
     const crawler = await getCrawlerStatusAsync();
 
-    const [queueByStatus, sources] = await Promise.all([
+    const [
+      founderCount,
+      companyCount,
+      queueByStatus,
+      sources,
+      withSourceSentence,
+      withEmail,
+      withX,
+      withCompany,
+      foundersHiringTrue,
+      foundersHiringFalse,
+      companiesHiringTrue,
+      companiesHiringFalse,
+      companiesWithEvidence,
+      relTotals,
+      recentJobs,
+    ] = await Promise.all([
+      Founder.countDocuments(),
+      Company.countDocuments(),
       CrawlUrlQueue.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
       CrawlSource.find({ enabled: true }).sort({ lastActivityAt: -1, name: 1 }).lean(),
+      Founder.countDocuments({ sourceSentence: { $ne: "" } }),
+      Founder.countDocuments({ email: { $ne: "" } }),
+      Founder.countDocuments({ $or: [{ xUrl: { $ne: "" } }, { xHandle: { $ne: "" } }] }),
+      Founder.countDocuments({ companies: { $exists: true, $not: { $size: 0 } } }),
+      Founder.countDocuments({ isHiring: true }),
+      Founder.countDocuments({ isHiring: false }),
+      Company.countDocuments({ isHiring: true }),
+      Company.countDocuments({ isHiring: false }),
+      Company.countDocuments({ hiringEvidence: { $ne: "" } }),
+      CrawlSource.aggregate([
+        { $group: { _id: null, created: { $sum: "$relationshipsCreated" }, rejected: { $sum: "$relationshipsRejected" } } },
+      ]),
+      CrawlJob.find()
+        .populate("sourceId", "name")
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .lean(),
     ]);
 
     const queueMap = Object.fromEntries(queueByStatus.map((q: { _id: string; count: number }) => [q._id, q.count]));
 
     const sourceStats = await Promise.all(
-      sources.map(async (s: any) => {
+      sources.map(async (s) => {
         const [discovered, remaining] = await Promise.all([
           CrawlUrlQueue.countDocuments({ sourceId: s._id }),
           CrawlUrlQueue.countDocuments({ sourceId: s._id, status: { $in: ["queued", "crawling"] } }),
@@ -123,6 +156,39 @@ export async function GET(req: NextRequest) {
           startedAt: crawler.startedAt,
           ticks: crawler.ticks,
         },
+        founderQuality: {
+          withSourceSentence,
+          withEmail,
+          withX,
+          withCompany,
+          hiringTrue: foundersHiringTrue,
+          hiringFalse: foundersHiringFalse,
+          hiringUnknown: founderCount - foundersHiringTrue - foundersHiringFalse,
+        },
+        companyQuality: {
+          hiringTrue: companiesHiringTrue,
+          hiringFalse: companiesHiringFalse,
+          hiringUnknown: companyCount - companiesHiringTrue - companiesHiringFalse,
+          withHiringEvidence: companiesWithEvidence,
+        },
+        relationships: {
+          created: relTotals[0]?.created || 0,
+          rejected: relTotals[0]?.rejected || 0,
+        },
+        recentJobs: recentJobs.map((j) => ({
+          _id: j._id,
+          sourceName:
+            (j.sourceId as unknown as { name?: string })?.name || "Unknown",
+          status: j.status,
+          createdAt: j.createdAt,
+          completedAt: j.completedAt || null,
+          pagesCrawled: j.pagesCrawled,
+          newFounders: j.newFounders,
+          relationshipsCreated: j.relationshipsCreated,
+          relationshipsRejected: j.relationshipsRejected,
+          rejectionReasons: j.rejectionReasons || [],
+          errors: (j.crawlErrors || []).length,
+        })),
         sourceStats,
         lastCrawl: lastJob
           ? {

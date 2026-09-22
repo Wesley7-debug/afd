@@ -25,6 +25,7 @@ export interface IFounder extends Document {
   companyLogoUrl: string;
   teamSize: number;
   isHiring: boolean | null;
+  hiringEvidence: string;
   foundedYear: number;
   oneLiner: string;
   sourceSentence: string;
@@ -61,6 +62,7 @@ const FounderSchema = new Schema<IFounder>(
     companyLogoUrl: { type: String, default: "" },
     teamSize: { type: Number, default: 0 },
     isHiring: { type: Boolean, default: null },
+    hiringEvidence: { type: String, default: "" },
     foundedYear: { type: Number, default: 0 },
     oneLiner: { type: String, default: "" },
     sourceSentence: { type: String, default: "" },

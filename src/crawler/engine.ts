@@ -452,6 +452,14 @@ async function saveFounderToDb(
       existing.isHiring = false;
       updated = true;
     }
+    if (
+      companyHiring.hiring !== null &&
+      !existing.hiringEvidence &&
+      companyHiring.evidence
+    ) {
+      existing.hiringEvidence = companyHiring.evidence;
+      updated = true;
+    }
     if (detected.foundedYear > 0 && existing.foundedYear === 0) {
       existing.foundedYear = detected.foundedYear;
       updated = true;
@@ -487,6 +495,7 @@ async function saveFounderToDb(
     sourceSentence: detected.sourceSentence || "",
     teamSize: detected.teamSize,
     isHiring: companyHiring.hiring,
+    hiringEvidence: companyHiring.evidence || "",
     foundedYear: detected.foundedYear,
     discoveredAt: new Date(),
     lastVerifiedAt: new Date(),

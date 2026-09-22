@@ -19,7 +19,7 @@ export async function POST(req: NextRequest) {
 
     const { collection } = await req.json();
 
-    let result = {
+    const result = {
       founders: 0,
       companies: 0,
       crawlJobs: 0,

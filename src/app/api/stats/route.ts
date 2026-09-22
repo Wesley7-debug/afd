@@ -12,6 +12,13 @@ export async function GET() {
       totalSources,
       lastJob,
       runningJob,
+      withSourceSentence,
+      withEmail,
+      foundersHiringTrue,
+      foundersHiringFalse,
+      companiesHiringTrue,
+      companiesHiringFalse,
+      companiesWithEvidence,
     ] = await Promise.all([
       Founder.countDocuments(),
       Company.countDocuments(),
@@ -22,6 +29,13 @@ export async function GET() {
       CrawlJob.findOne({ status: "running" })
         .populate("sourceId", "name")
         .lean(),
+      Founder.countDocuments({ sourceSentence: { $ne: "" } }),
+      Founder.countDocuments({ email: { $ne: "" } }),
+      Founder.countDocuments({ isHiring: true }),
+      Founder.countDocuments({ isHiring: false }),
+      Company.countDocuments({ isHiring: true }),
+      Company.countDocuments({ isHiring: false }),
+      Company.countDocuments({ hiringEvidence: { $ne: "" } }),
     ]);
 
     let newFounders = 0;
@@ -66,8 +80,23 @@ export async function GET() {
       founderProfiles,
       companiesDiscovered,
       countriesDiscovered,
+      quality: {
+        withSourceSentence,
+        withEmail,
+        foundersHiring: {
+          true: foundersHiringTrue,
+          false: foundersHiringFalse,
+          unknown: totalFounders - foundersHiringTrue - foundersHiringFalse,
+        },
+        companiesHiring: {
+          true: companiesHiringTrue,
+          false: companiesHiringFalse,
+          unknown: totalCompanies - companiesHiringTrue - companiesHiringFalse,
+        },
+        companiesWithEvidence,
+      },
     });
-  } catch (error) {
+  } catch {
     return NextResponse.json(
       { error: "Failed to fetch stats" },
       { status: 500 }
